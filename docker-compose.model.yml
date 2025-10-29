@@ -1,0 +1,7 @@
+services:
+  inference:
+    environment:
+      - MODEL_ID=Qwen/Qwen2-VL-7B-Instruct
+      - GPU_INDEX=0
+      - GPU_MEM=8GiB
+      - CPU_MEM=48GiB

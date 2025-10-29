@@ -1,0 +1,47 @@
+chips:
+  mbtiles: /project/data/rasters/ortho_2017_demo.mbtiles
+  out_dir: /project/data/chips/chipping_debug
+  z: 17
+  # WGS84 (World Geodetic System 1984) lon/lat degrees
+  bbox: [17.671509, 59.199142, 18.531189, 59.488332]
+  max_tiles: 300
+  tile_source: mbtiles   # use MBTiles explicitly
+  /raster_base: ""       # leave empty unless you force HTTP tiles
+model:
+  name: openai/clip-vit-large-patch14
+  fallback: openai/clip-vit-large-patch14
+  device: auto
+index:
+  host: qdrant
+  port: 6333
+  collection: sweden_demo_v0
+  distance: Cosine
+runtime:
+  batch_size: 256
+  num_workers: 4
+
+
+# chips:
+#   # If mbtiles is unknown, auto-detect at runtime.
+#   mbtiles: /project/data/rasters/ortho_2017_demo.mbtiles
+#   out_dir: /project/data/chips
+#   z: 17
+#   # lon_min, lat_min, lon_max, lat_max (WGS84)
+#   bbox: [17.671509, 59.199142,18.531189,59.488332] # [12.95, 57.70, 13.05, 57.76]
+#   max_tiles: 300
+#   # tile_source can be "http" or "mbtiles"; "auto" tries http first.
+#   tile_source: mbtiles
+#   # optional HTTP raster base; will be auto-discovered if empty:
+#   /raster_base: ""
+# model:
+#   name: openai/clip-vit-large-patch14 # google/siglip-so400m-patch14-384
+#   fallback: openai/clip-vit-large-patch14
+#   device: auto
+# index:
+#   host: qdrant
+#   port: 6333
+#   collection: sweden_demo_v0
+#   distance: Cosine
+# runtime:
+#   batch_size: 32
+#   num_workers: 4

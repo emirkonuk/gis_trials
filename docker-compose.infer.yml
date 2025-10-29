@@ -1,0 +1,23 @@
+services:
+  inference:
+    image: python:3.11-slim
+    container_name: gis_inference
+    working_dir: /app
+    command: python app.py
+    volumes:
+      - ./docker_mount/project:/project
+      - ./docker/inference:/app
+    environment:
+      PYTHONUNBUFFERED: 1
+    ports: ["8081:8081"]
+
+  web_infer:
+    image: nginx:alpine
+    container_name: gis_web_infer
+    ports: ["8082:8080"]
+    volumes:
+      - ./docker/nginx.infer.conf:/etc/nginx/nginx.conf:ro
+      - ./docker_mount/project:/project:ro
+    depends_on:
+      - inference
+

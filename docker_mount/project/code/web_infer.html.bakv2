@@ -1,0 +1,202 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Inference UI</title>
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet"/>
+  <style>
+    html,body{height:100%;margin:0}
+    #map{position:absolute; inset:0 320px 0 0}
+    #panel{position:absolute; top:0; right:0; width:320px; height:100%; background:#fff; border-left:1px solid #ddd; font:14px system-ui; display:flex; flex-direction:column}
+    #controls{padding:10px; border-bottom:1px solid #eee}
+    #layers{padding:10px; border-bottom:1px solid #eee; overflow:auto; max-height:45%}
+    #out{flex:1; padding:10px; overflow:auto; background:#fafafa; font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap}
+    .row{display:flex; align-items:center; gap:6px; margin:4px 0}
+    .swatch{width:12px; height:12px; border:1px solid #999; display:inline-block}
+    .muted{opacity:.6}
+    button{cursor:pointer}
+    input[type="text"]{width:100%}
+    h4{margin:8px 0 4px 0; font-size:13px; color:#444}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <div id="controls">
+      <div class="row"><input id="prompt" type="text" placeholder="Describe key man-made and natural features."></div>
+      <div class="row"><button id="run">Run Inference</button></div>
+      <div class="row"><label><input id="use-extent" type="radio" name="bbox" checked> use visible extent</label></div>
+    </div>
+
+    <div id="layers">
+      <h4>Base</h4>
+      <div class="row"><label><input id="chk-raster" type="checkbox" checked> raster</label></div>
+      <div class="row"><label><input id="chk-results" type="checkbox" checked> results</label></div>
+
+      <h4>Vectors</h4>
+      <div class="row"><label><input id="chk-vectors" type="checkbox"> show vector layers</label></div>
+      <div id="group" class="muted"></div>
+    </div>
+
+    <div id="out">awaiting request…</div>
+  </div>
+
+  <script>
+  const uid = () =>
+  (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'id-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,8);
+
+  const ORIGIN = location.origin;
+  const map = new maplibregl.Map({container:'map', style:{version:8,sources:{},layers:[]}, center:[18.10,59.35], zoom:14});
+
+  let NAME_MAP = {};
+  let overlayId = null;
+
+  function setOverlayVisible(on){
+    if(!overlayId) return;
+    if(map.getLayer(overlayId)){
+      map.setLayoutProperty(overlayId, 'visibility', on ? 'visible' : 'none');
+    }
+  }
+
+  function labelFor(id, fallback){ return NAME_MAP[id] || fallback || id; }
+  function colorFor(id){ let h=0; for(let i=0;i<id.length;i++) h=(h*31+id.charCodeAt(i))>>>0; return `hsl(${h%360} 90% 45%)`; }
+
+  // tile helpers
+  function lon2tile(lon,z){ return Math.floor((lon+180)/360*Math.pow(2,z)); }
+  function lat2tile(lat,z){ return Math.floor((1-Math.log(Math.tan(lat*Math.PI/180)+1/Math.cos(lat*Math.PI/180))/Math.PI)/2*Math.pow(2,z)); }
+  function t2lon(x,z){ return x/2**z*360-180; }
+  function t2lat(y,z){ const n=Math.PI-2*Math.PI*y/2**z; return 180/Math.PI*Math.atan(0.5*(Math.exp(n)-Math.exp(-n))); }
+
+  map.on('load', init);
+
+  async function init(){
+    // Raster base
+    map.addSource('ortho',{type:'raster', tiles:[`${ORIGIN}/raster/services/ortho_2017_demo/tiles/{z}/{x}/{y}.jpg`], tileSize:256, minzoom:0, maxzoom:32});
+    map.addLayer({id:'ortho', type:'raster', source:'ortho'});
+    document.getElementById('chk-raster').addEventListener('change', e=>{
+      map.setLayoutProperty('ortho','visibility', e.target.checked?'visible':'none');
+    });
+
+    // Results checkbox
+    document.getElementById('chk-results').addEventListener('change', e=> setOverlayVisible(e.target.checked));
+
+    // Names
+    try {
+      const r = await fetch(`${ORIGIN}/layer_names.json`, {headers:{'Accept':'application/json'}});
+      if(r.ok) NAME_MAP = await r.json();
+    } catch {}
+
+    // Vector index
+    const group = document.getElementById('group');
+    let idx = {};
+    try {
+      const r = await fetch(`${ORIGIN}/vector/index.json`, {headers:{'Accept':'application/json'}});
+      idx = await r.json();
+    } catch { group.innerHTML = '<div style="color:#b00">failed to load /vector/index.json</div>'; }
+
+    group.innerHTML = '';
+    const added = new Set();
+    const entries = Object.values(idx || {});
+    for(const ent of entries){
+      const id = ent.id, label = labelFor(id, ent.name), color = colorFor(id);
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span class="swatch" style="background:${color}"></span>
+                       <label><input type="checkbox" data-id="${id}"> ${label}</label>`;
+      group.appendChild(row);
+    }
+
+    const master = document.getElementById('chk-vectors');
+    const setGroupEnabled = on=>{
+      group.classList.toggle('muted',!on);
+      group.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+        cb.disabled=!on;
+        if(!on && cb.checked){ cb.checked=false; toggleOne(cb.dataset.id,false); }
+      });
+    };
+    setGroupEnabled(false);
+    master.addEventListener('change',e=>setGroupEnabled(e.target.checked));
+
+    group.addEventListener('change', async ev=>{
+      const cb = ev.target; if(!cb?.dataset?.id) return;
+      const id = cb.dataset.id;
+      if(cb.checked && !added.has(id)){
+        let geom=''; try{
+          const d=await (await fetch(`${ORIGIN}/vector/${id}.json`,{headers:{'Accept':'application/json'}})).json();
+          geom=(d.geometrytype||'').toLowerCase();
+        }catch{}
+        const color=colorFor(id);
+        map.addSource(id,{type:'vector',tiles:[`${ORIGIN}/vector/${id}/{z}/{x}/{y}.pbf`],minzoom:0,maxzoom:32});
+        if(geom.includes('polygon')){
+          map.addLayer({id:`${id}-fill`,type:'fill',source:id,'source-layer':id,paint:{'fill-color':color,'fill-opacity':0.20}});
+          map.addLayer({id:`${id}-outline`,type:'line',source:id,'source-layer':id,paint:{'line-color':color,'line-width':2}});
+        }else if(geom.includes('line')){
+          map.addLayer({id:`${id}-line`,type:'line',source:id,'source-layer':id,paint:{'line-color':color,'line-width':2}});
+        }else{
+          map.addLayer({id:`${id}-point`,type:'circle',source:id,'source-layer':id,paint:{'circle-radius':3,'circle-color':color}});
+        }
+        added.add(id);
+      }
+      toggleOne(id, cb.checked);
+    });
+
+    function toggleOne(id, show){
+      (map.getStyle().layers||[]).filter(l=>l.id.startsWith(id+'-'))
+        .forEach(l=>map.setLayoutProperty(l.id,'visibility', show?'visible':'none'));
+    }
+
+    // Run → POST /infer/mbtile → overlay at XYZ bounds
+    document.getElementById('run').onclick = async ()=>{
+      const out = document.getElementById('out');
+      const prompt = document.getElementById('prompt').value || "Describe key man-made and natural features.";
+      const z = Math.max(0, Math.round(map.getZoom()));
+      const c = map.getCenter();
+      const x = lon2tile(c.lng, z);
+      const y = lat2tile(c.lat, z);
+
+      out.textContent = 'requesting…';
+      try{
+        const r = await fetch(`/infer/mbtile`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ mbtiles:'/project/data/rasters/ortho_2017_demo.mbtiles', text: prompt, z, x, y })
+        });
+        const d = await r.json();
+        // out.textContent = JSON.stringify(d, null, 2);
+        out.textContent = [
+                           "output:",
+                           d.text || "(no text)",
+                           "",
+                           "tile (z/x/y):",
+                           `${d.tile?.z}/${d.tile?.x}/${d.tile?.y}`
+                         ].join("\n");
+
+
+        if(d.image_url && d.tile){
+          // clean old overlay
+          if(overlayId){
+            if(map.getLayer(overlayId)) map.removeLayer(overlayId);
+            if(map.getSource(overlayId)) map.removeSource(overlayId);
+          }
+          // overlayId = `overlay-${crypto.randomUUID()}`;
+          overlayId = `overlay-${uid()}`;
+          const url = d.image_url.startsWith('http') ? d.image_url : `${ORIGIN}${d.image_url}`;
+
+          const w=t2lon(d.tile.x, d.tile.z), e=t2lon(d.tile.x+1, d.tile.z);
+          const n=t2lat(d.tile.y, d.tile.z), s=t2lat(d.tile.y+1, d.tile.z);
+
+          map.addSource(overlayId, { type:'image', url, coordinates:[[w,n],[e,n],[e,s],[w,s]] });
+          map.addLayer({ id:overlayId, type:'raster', source:overlayId, paint:{'raster-opacity':0.8} });
+          setOverlayVisible(document.getElementById('chk-results').checked);
+        }
+      }catch(e){
+        out.textContent = 'error: '+ e;
+      }
+    };
+  }
+  </script>
+</body>
+</html>

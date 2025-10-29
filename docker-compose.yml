@@ -1,0 +1,59 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: gis_db
+    environment:
+      POSTGRES_USER: ${PGUSER}
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: ${PGDATABASE}
+    ports: ["55432:5432"]        # host:container
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: gis_worker
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: ${PGUSER}
+      PGPASSWORD: ${PGPASSWORD}
+      PGDATABASE: ${PGDATABASE}
+      SCHEMA: lm
+      PROJECT: /project
+    working_dir: /project
+    volumes:
+      - ./docker_mount/project:/project   # RW
+
+  pgtileserv:
+    image: pramsey/pg_tileserv:latest
+    container_name: gis_pgtileserv
+    environment:
+      DATABASE_URL: postgresql://${PGUSER}:${PGPASSWORD}@db:5432/${PGDATABASE}
+    ports: ["7800:7800"]
+
+  mbtileserver:
+    image: ghcr.io/consbio/mbtileserver:0.11.0
+    container_name: gis_mbtileserver
+    command: ["-d","/project/data/rasters","-p","8090"]
+    volumes:
+      - ./docker_mount/project:/project
+    ports: ["8090:8090"]
+    
+  web:
+    image: nginx:alpine
+    container_name: gis_web
+    ports: ["8080:8080"]
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker_mount/project:/project:ro
+    depends_on:
+      - pgtileserv
+      - mbtileserver
+
+
+volumes:
+  pgdata:
+

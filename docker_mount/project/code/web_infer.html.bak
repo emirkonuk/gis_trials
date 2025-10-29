@@ -1,0 +1,190 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Inference UI</title>
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet"/>
+  <style>
+    html,body{height:100%;margin:0}
+    #map{position:absolute; inset:0 320px 0 0}
+    #panel{position:absolute; top:0; right:0; width:320px; height:100%; background:#fff; border-left:1px solid #ddd; font:14px system-ui; display:flex; flex-direction:column}
+    #controls{padding:10px; border-bottom:1px solid #eee}
+    #layers{padding:10px; border-bottom:1px solid #eee; overflow:auto; max-height:45%}
+    #out{flex:1; padding:10px; overflow:auto; background:#fafafa; font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap}
+    .row{display:flex; align-items:center; gap:6px; margin:4px 0}
+    .swatch{width:12px; height:12px; border:1px solid #999; display:inline-block}
+    .muted{opacity:.6}
+    button{cursor:pointer}
+    input[type="text"]{width:100%}
+    h4{margin:8px 0 4px 0; font-size:13px; color:#444}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <div id="controls">
+      <div class="row"><input id="prompt" type="text" placeholder="text input"></div>
+      <div class="row"><button id="run">Run Inference</button></div>
+      <div class="row"><label><input id="use-extent" type="radio" name="bbox" checked> use visible extent</label></div>
+    </div>
+
+    <div id="layers">
+      <h4>Base</h4>
+      <div class="row"><label><input id="chk-raster" type="checkbox" checked> raster</label></div>
+      <div class="row"><label><input id="chk-results" type="checkbox" checked> results</label></div>
+
+      <h4>Vectors</h4>
+      <div class="row"><label><input id="chk-vectors" type="checkbox"> show vector layers</label></div>
+      <div id="group" class="muted"></div>
+    </div>
+
+    <div id="out">awaiting request…</div>
+  </div>
+
+  <script>
+  const ORIGIN = location.origin;              // http://127.0.0.1:8082
+  let NAME_MAP = {};                           // english names
+  const map = new maplibregl.Map({container:'map', style:{version:8,sources:{},layers:[]}, center:[18.10,59.35], zoom:14});
+
+  // overlay tracking + show/hide
+  let overlayId = null;
+  function setOverlayVisible(on){
+    if(!overlayId) return;
+    if(map.getLayer(overlayId)){
+      map.setLayoutProperty(overlayId, 'visibility', on ? 'visible' : 'none');
+    }
+  }
+
+  function labelFor(id, fallback){ return NAME_MAP[id] || fallback || id; }
+  function colorFor(id){ let h=0; for(let i=0;i<id.length;i++) h=(h*31+id.charCodeAt(i))>>>0; return `hsl(${h%360} 90% 45%)`; }
+
+  map.on('load', init);
+
+  async function init(){
+    // Raster
+    map.addSource('ortho',{type:'raster', tiles:[`${ORIGIN}/raster/services/ortho_2017_demo/tiles/{z}/{x}/{y}.jpg`], tileSize:256, minzoom:0, maxzoom:22});
+    map.addLayer({id:'ortho', type:'raster', source:'ortho'});
+    document.getElementById('chk-raster').addEventListener('change', e=>{
+      map.setLayoutProperty('ortho','visibility', e.target.checked?'visible':'none');
+    });
+
+    // Results checkbox
+    document.getElementById('chk-results').addEventListener('change', e=>{
+      setOverlayVisible(e.target.checked);
+    });
+
+    // Load english names
+    try {
+      const r = await fetch(`${ORIGIN}/layer_names.json`, {headers:{'Accept':'application/json'}});
+      if(r.ok) NAME_MAP = await r.json();
+    } catch {}
+
+    // Build vector layer list
+    const group = document.getElementById('group');
+    let idx = {};
+    try {
+      const r = await fetch(`${ORIGIN}/vector/index.json`, {headers:{'Accept':'application/json'}});
+      idx = await r.json();
+    } catch { group.innerHTML = '<div style="color:#b00">failed to load /vector/index.json</div>'; }
+
+    group.innerHTML = '';
+    const added = new Set();
+    const entries = Object.values(idx || {});
+    for(const ent of entries){
+      const id = ent.id, label = labelFor(id, ent.name), color = colorFor(id);
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.innerHTML = `<span class="swatch" style="background:${color}"></span>
+                       <label><input type="checkbox" data-id="${id}"> ${label}</label>`;
+      group.appendChild(row);
+    }
+
+    const master = document.getElementById('chk-vectors');
+    const setGroupEnabled = on=>{
+      group.classList.toggle('muted',!on);
+      group.querySelectorAll('input[type=checkbox]').forEach(cb=>{
+        cb.disabled=!on;
+        if(!on && cb.checked){ cb.checked=false; toggleOne(cb.dataset.id,false); }
+      });
+    };
+    setGroupEnabled(false);
+    master.addEventListener('change',e=>setGroupEnabled(e.target.checked));
+
+    group.addEventListener('change', async ev=>{
+      const cb = ev.target; if(!cb?.dataset?.id) return;
+      const id = cb.dataset.id;
+      if(cb.checked && !added.has(id)){
+        let geom=''; try{
+          const d=await (await fetch(`${ORIGIN}/vector/${id}.json`,{headers:{'Accept':'application/json'}})).json();
+          geom=(d.geometrytype||'').toLowerCase();
+        }catch{}
+        const color=colorFor(id);
+        map.addSource(id,{type:'vector',tiles:[`${ORIGIN}/vector/${id}/{z}/{x}/{y}.pbf`],minzoom:0,maxzoom:22});
+        if(geom.includes('polygon')){
+          map.addLayer({id:`${id}-fill`,type:'fill',source:id,'source-layer':id,paint:{'fill-color':color,'fill-opacity':0.20}});
+          map.addLayer({id:`${id}-outline`,type:'line',source:id,'source-layer':id,paint:{'line-color':color,'line-width':2}});
+        }else if(geom.includes('line')){
+          map.addLayer({id:`${id}-line`,type:'line',source:id,'source-layer':id,paint:{'line-color':color,'line-width':2}});
+        }else{
+          map.addLayer({id:`${id}-point`,type:'circle',source:id,'source-layer':id,paint:{'circle-radius':3,'circle-color':color}});
+        }
+        added.add(id);
+      }
+      toggleOne(id, cb.checked);
+    });
+
+    function toggleOne(id, show){
+      (map.getStyle().layers||[]).filter(l=>l.id.startsWith(id+'-'))
+        .forEach(l=>map.setLayoutProperty(l.id,'visibility', show?'visible':'none'));
+    }
+
+    // Run → POST → side panel + optional overlay
+    document.getElementById('run').onclick = async ()=>{
+      const out = document.getElementById('out');
+      const text = document.getElementById('prompt').value || '';
+      const b = map.getBounds();
+      const bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+
+      out.textContent = 'requesting…';
+      try{
+        const r = await fetch(`${ORIGIN}/infer/api`,{
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({text, bbox})
+        });
+        const j = await r.json();
+        out.textContent = JSON.stringify(j, null, 2);
+
+        if(j.image_url){
+          // remove old overlay
+          if(overlayId){
+            if(map.getLayer(overlayId)) map.removeLayer(overlayId);
+            if(map.getSource(overlayId)) map.removeSource(overlayId);
+          }
+          overlayId = `overlay-${Date.now()}`;
+          const url = j.image_url.startsWith('http') ? j.image_url : `${ORIGIN}${j.image_url}`;
+
+          // add as image source over current bbox
+          map.addSource(overlayId, {
+            type:'image',
+            url,
+            coordinates: [
+              [bbox[0], bbox[3]], // top-left
+              [bbox[2], bbox[3]], // top-right
+              [bbox[2], bbox[1]], // bottom-right
+              [bbox[0], bbox[1]]  // bottom-left
+            ]
+          });
+          map.addLayer({id:overlayId, type:'raster', source:overlayId, paint:{'raster-opacity':0.8}});
+          setOverlayVisible(document.getElementById('chk-results').checked);
+        }
+      }catch(e){
+        out.textContent = 'error: '+ e;
+      }
+    };
+  }
+  </script>
+</body>
+</html>
+

@@ -1,0 +1,15 @@
+torch
+torchvision
+transformers
+pillow
+rasterio
+mercantile
+numpy
+qdrant-client
+pydantic
+pyyaml
+tqdm
+pandas
+requests
+sentencepiece
+pyarrow
