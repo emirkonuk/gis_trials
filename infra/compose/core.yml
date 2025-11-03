@@ -16,7 +16,7 @@ services:
   worker:
     build:
       context: ..
-      dockerfile: docker/Dockerfile.worker
+      dockerfile: infra/dockerfiles/worker.Dockerfile
     container_name: gis_worker
     environment:
       PGHOST: db
@@ -29,10 +29,10 @@ services:
       GIS_STACK_ROOT: /workspace
     working_dir: /workspace
     volumes:
-      - ../scripts:/workspace/scripts
-      - ../data:/workspace/data
-      - ../app:/workspace/app
-      - ../legacy:/workspace/legacy:ro
+      - ../../scripts:/workspace/scripts
+      - ../../src:/workspace/src:ro
+      - ../../data:/workspace/data
+      - ../../legacy:/workspace/legacy:ro
     depends_on:
       - db
 
@@ -51,7 +51,7 @@ services:
     container_name: gis_mbtileserver
     command: ["-d","/workspace/data/rasters","-p","8090"]
     volumes:
-      - ../data:/workspace/data:ro
+      - ../../data:/workspace/data:ro
     ports:
       - "8090:8090"
 
@@ -61,10 +61,10 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ../docker/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ../app/web:/workspace/app/web:ro
-      - ../app/results:/workspace/app/results:ro
-      - ../data:/workspace/data:ro
+      - ../configs/nginx/core.conf:/etc/nginx/nginx.conf:ro
+      - ../../src/web:/workspace/web:ro
+      - ../../data/results:/workspace/results:ro
+      - ../../data:/workspace/data:ro
     depends_on:
       - pgtileserv
       - mbtileserver

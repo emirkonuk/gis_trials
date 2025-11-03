@@ -5,7 +5,7 @@ This helper was used while debugging the 2017 raster colour pipeline. It tiles e
 You should not need it during normal operation: `bootstrap.sh` and `scripts/rebuild_rasters.sh` already regenerate colour-corrected MBTiles automatically. Keep this script only if you need to experiment or run ad-hoc rebuilds without touching the main workflow:
 
 ```bash
-docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'code/fixes/ortho_2017_rebuild/rebuild_2017_from_sources.sh'
+docker compose -f infra/compose/core.yml run --rm worker bash -lc 'tools/ortho_2017_rebuild/rebuild_2017_from_sources.sh'
 ```
 
 Remove the directory if you do not plan to run manual rebuilds.

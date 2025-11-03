@@ -6,21 +6,26 @@ This directory reshapes the original `map_serving` tree into a reproducible, fla
 
 ```
 gis-stack/
-  app/            # FastAPI inference, retrieval code, static web assets, model cache
-  compose/        # Docker Compose bundles (core, inference, retrieval)
-  data/           # User- and runtime-managed data; only archives/ must be populated manually
-    archives/     # Drop input ZIP/TAR files here before running bootstrap.sh
-    extracted/    # Created on first bootstrap; contains unpacked inputs
-    rasters/      # Raster mosaics + MBTiles built by the worker image
-    vector/       # Placeholder for derived vectors or exports
-    inventory/    # Text reports created by inventory_extracted.sh
-    chips/        # Retrieval chip pipeline outputs (PNGs, metadata, embeddings)
-    qdrant/       # Persistent storage for the retrieval Qdrant instance
-  docker/         # Dockerfiles and Nginx configs for the stack
-  legacy/         # Original helper scripts kept for reference
-  scripts/        # Data preparation helpers (extraction, inventory, rasters, vectors)
-  bootstrap.sh    # Single entrypoint to build, start, and prepare the stack
-  README.md       # This file
+  infra/
+    compose/      # docker-compose bundles (core, inference, retrieval)
+    dockerfiles/  # per-service Dockerfiles
+    configs/      # nginx and related runtime configs
+  src/
+    inference/    # FastAPI VLM service
+    retrieval/    # Qdrant index + search API
+    web/          # static assets served by nginx
+  scripts/        # data/extraction/raster helpers invoked by bootstrap.sh
+  tools/          # optional utilities (one-off rebuild helpers)
+  legacy/         # archived scripts kept for reference only
+  docs/           # README, reports, troubleshooting notes
+  data/           # runtime storage (archives, extracted tiles, rasters, qdrant, results)
+    archives/
+    extracted/
+    rasters/
+    results/
+    models/
+  bootstrap.sh    # single entrypoint
+  README.md
 ```
 
 ## One-step bootstrap
@@ -30,7 +35,7 @@ gis-stack/
 
 `bootstrap.sh` will:
 
-- create any missing runtime folders (`data/extracted`, `data/rasters/ortho_{2011,2017}`, `data/vector`, `data/inventory`, `data/chips`, `data/qdrant`, `app/results`),
+- create any missing runtime folders (`data/extracted`, `data/rasters/ortho_{2011,2017}`, `data/vector`, `data/inventory`, `data/chips`, `data/qdrant`, `data/results`, `data/models`),
 - remove only this project’s containers while preserving any host containers whose names include `skk-mssql` or `serene_almeida`,
 - build all Docker images with `--no-cache` on the first run (use `--force-build` to rebuild later),
 - start core services (Postgres/PostGIS, pg_tileserv, mbtileserver, nginx) followed by inference and retrieval stacks,
@@ -47,36 +52,36 @@ Drop the new archives into `data/archives/` and rerun `./bootstrap.sh`. The scri
 ### Running individual pieces
 
 - **Extraction**  
-  `docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/extract_archives.sh'`
+  `docker compose -f infra/compose/core.yml run --rm worker bash -lc 'scripts/extract_archives.sh'`
 
 - **Inventory**  
-  `docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/inventory_extracted.sh'`
+  `docker compose -f infra/compose/core.yml run --rm worker bash -lc 'scripts/inventory_extracted.sh'`
 
 - **Raster rebuild (2011 + 2017 RGB fix)**  
-  `docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/rebuild_rasters.sh'`  
+  `docker compose -f infra/compose/core.yml run --rm worker bash -lc 'scripts/rebuild_rasters.sh'`  
   (Uses `gdal_translate -b 2 -b 3 -b 3` for 2017 and only rebuilds when `ortho_2017_rgb.tif`/MBTiles are missing; set `GIS_BOOTSTRAP_FORCE_RASTERS=1` to force it.)
 
 - **Vector load**  
-  `rm -f data/.vectors_loaded && docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/load_vectors_to_postgis.v2.sh'`  
+  `rm -f data/.vectors_loaded && docker compose -f infra/compose/core.yml run --rm worker bash -lc 'scripts/load_vectors_to_postgis.v2.sh'`  
   (Alternatively run `./bootstrap.sh --force-vectors`.)
 
 - **Tile services only (db + pg_tileserv + mbtileserver + nginx)**  
-  `docker compose -f compose/docker-compose.yml up -d --force-recreate db pgtileserv mbtileserver web`
+  `docker compose -f infra/compose/core.yml up -d --force-recreate db pgtileserv mbtileserver web`
 
 - **Inference stack only**  
-  `docker compose -f compose/docker-compose.yml -f compose/docker-compose.infer.yml up -d --force-recreate inference web_infer`
+  `docker compose -f infra/compose/core.yml -f infra/compose/inference.yml up -d --force-recreate inference web_infer`
 
 - **Retrieval services only (Qdrant + API)**  
-  `docker compose -f compose/docker-compose.retrieval.yml up -d --force-recreate qdrant retrieval_gpu`
+  `docker compose -f infra/compose/retrieval.yml up -d --force-recreate qdrant retrieval_gpu`
 
 - **Retrieval ETL (chips → embeddings → index)**  
-  `docker compose -f compose/docker-compose.retrieval.yml run --rm retrieval_gpu bash -lc 'cd /workspace/app/retrieval && python3 chips_make.py && python3 embed.py && python3 index_qdrant.py'`
+  `docker compose -f infra/compose/retrieval.yml run --rm retrieval_gpu bash -lc 'cd /workspace/retrieval && python3 chips_make.py && python3 embed.py && python3 index_qdrant.py'`
 
 - **Stack smoke test (health-gated)**  
   `./scripts/check_stack.sh`
 
 When raster filenames change, restart only the web-facing services with  
-`docker compose -f compose/docker-compose.yml up -d web web_infer mbtileserver`  
+`docker compose -f infra/compose/core.yml up -d web web_infer mbtileserver`  
 and rerun `./scripts/check_stack.sh` to confirm the stack. `bootstrap.sh` automatically invokes the same smoke tests at the end of every run and aborts if any endpoint fails.
 
 ## GPU assignment
@@ -91,12 +96,12 @@ and rerun `./scripts/check_stack.sh` to confirm the stack. `bootstrap.sh` automa
 
 ## Retrieval ETL refresh
 
-The retrieval toolkit lives in `app/retrieval/`. During bootstrap the script will copy the legacy chips/embeddings from `map_serving` when they are present, or rebuild them (`chips_make.py`, `embed.py`, `index_qdrant.py`) if they are missing. You can force a rebuild with `./bootstrap.sh --force-retrieval ...` or trigger individual steps manually:
+The retrieval toolkit lives in `src/retrieval/`. During bootstrap the script will copy the legacy chips/embeddings from `map_serving` when they are present, or rebuild them (`chips_make.py`, `embed.py`, `index_qdrant.py`) if they are missing. You can force a rebuild with `./bootstrap.sh --force-retrieval ...` or trigger individual steps manually:
 
 ```bash
-docker compose -f compose/docker-compose.retrieval.yml run --rm \
+docker compose -f infra/compose/retrieval.yml run --rm \
   -e SEARCH_GPU=1 -e CUDA_VISIBLE_DEVICES=1 \
-  retrieval_gpu bash -lc 'cd /workspace/app/retrieval && python3 chips_make.py && python3 embed.py && python3 index_qdrant.py'
+  retrieval_gpu bash -lc 'cd /workspace/retrieval && python3 chips_make.py && python3 embed.py && python3 index_qdrant.py'
 ```
 
 The FastAPI search service exposed at `/search/text` is defined in `search_api.py` and is proxied through Nginx at `http://127.0.0.1:8082/search/`. `bootstrap.sh` fires a smoke query (`?q=roads&topk=1`) and aborts if the request fails or the Qdrant collection is undersized (< 10 000 points).
@@ -131,5 +136,5 @@ Debug utilities that were used while developing this fix now live in `code/fixes
 ## Notes
 
 - All Docker Compose files run relative to `gis-stack/`; the project root can be moved or rsynced without editing paths.
-- GPU-specific overrides live in `compose/docker-compose.infer.gpu.local.yml`. If you do not have a GPU, simply omit that file.
+- GPU-specific overrides live in `infra/compose/inference.gpu.local.yml`. If you do not have a GPU, simply omit that file.
 - Legacy scripts from the previous layout reside in `legacy/` with a header noting that they are no longer wired into `bootstrap.sh`.

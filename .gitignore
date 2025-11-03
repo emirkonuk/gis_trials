@@ -1,6 +1,6 @@
+# Generated data and caches
 data/
-app/models/
-app/results/
+app/
 __pycache__/
 *.pyc
 .bootstrap_tmp/
@@ -10,4 +10,5 @@ __pycache__/
 *.bad.mbtiles
 *.tif
 *.tiff
-notes/*.log
+models/
+.bootstrap_built

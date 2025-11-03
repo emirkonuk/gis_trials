@@ -49,8 +49,9 @@ export GIS_BOOTSTRAP_FORCE_RETRIEVAL GIS_BOOTSTRAP_FORCE_VECTORS
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$ROOT/data"
-APP_DIR="$ROOT/app"
-COMPOSE_DIR="$ROOT/compose"
+RESULTS_DIR="$DATA_DIR/results"
+MODELS_DIR="$DATA_DIR/models"
+COMPOSE_DIR="$ROOT/infra/compose"
 BUILD_MARKER="$ROOT/.bootstrap_built"
 TMP_DIR="$ROOT/.bootstrap_tmp"
 VECTOR_MARKER="$DATA_DIR/.vectors_loaded"
@@ -64,7 +65,8 @@ mkdir -p \
   "$DATA_DIR/inventory" \
   "$DATA_DIR/chips" \
   "$DATA_DIR/qdrant" \
-  "$APP_DIR/results" \
+  "$RESULTS_DIR" \
+  "$MODELS_DIR" \
   "$TMP_DIR"
 
 export PGUSER="${PGUSER:-gis}"
@@ -75,19 +77,19 @@ export PGHOST_PORT="${PGHOST_PORT:-55432}"
 
 echo "[bootstrap] root: $ROOT"
 
-declare -a CORE_COMPOSE=(-f "$COMPOSE_DIR/docker-compose.yml")
+declare -a CORE_COMPOSE=(-f "$COMPOSE_DIR/core.yml")
 declare -a INFER_COMPOSE=()
 declare -a RETRIEVE_COMPOSE=()
 
-if [[ -f "$COMPOSE_DIR/docker-compose.infer.yml" ]]; then
-  INFER_COMPOSE=(${CORE_COMPOSE[@]} -f "$COMPOSE_DIR/docker-compose.infer.yml")
-  if [[ -f "$COMPOSE_DIR/docker-compose.infer.gpu.local.yml" ]]; then
-    INFER_COMPOSE+=(-f "$COMPOSE_DIR/docker-compose.infer.gpu.local.yml")
+if [[ -f "$COMPOSE_DIR/inference.yml" ]]; then
+  INFER_COMPOSE=(${CORE_COMPOSE[@]} -f "$COMPOSE_DIR/inference.yml")
+  if [[ -f "$COMPOSE_DIR/inference.gpu.local.yml" ]]; then
+    INFER_COMPOSE+=(-f "$COMPOSE_DIR/inference.gpu.local.yml")
   fi
 fi
 
-if [[ -f "$COMPOSE_DIR/docker-compose.retrieval.yml" ]]; then
-  RETRIEVE_COMPOSE=(-f "$COMPOSE_DIR/docker-compose.retrieval.yml")
+if [[ -f "$COMPOSE_DIR/retrieval.yml" ]]; then
+  RETRIEVE_COMPOSE=(-f "$COMPOSE_DIR/retrieval.yml")
 fi
 
 check_container() {
@@ -177,7 +179,7 @@ import json, os, sys
 from pathlib import Path
 import yaml
 from qdrant_client import QdrantClient
-cfg_path = Path(os.getenv("RETRIEVAL_CONFIG", "/workspace/app/retrieval/config.yaml"))
+cfg_path = Path(os.getenv("RETRIEVAL_CONFIG", "/workspace/retrieval/config.yaml"))
 cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
 collection = os.getenv("QDRANT_COLLECTION", cfg.get("index", {}).get("collection", "sweden_demo_v0"))
 client = QdrantClient(host="qdrant", port=6333, timeout=30)
@@ -230,7 +232,7 @@ build_retrieval_assets() {
       -e GIS_BOOTSTRAP_FORCE_RETRIEVAL="$GIS_BOOTSTRAP_FORCE_RETRIEVAL" \
       retrieval_gpu bash -lc '
         set -euo pipefail
-        cd /workspace/app/retrieval
+        cd /workspace/retrieval
         if [[ "$GIS_BOOTSTRAP_FORCE_RETRIEVAL" == "1" || ! -f /workspace/data/chips/chips_index.csv ]]; then
           python3 chips_make.py
         fi
@@ -246,7 +248,7 @@ build_retrieval_assets() {
       -e CUDA_VISIBLE_DEVICES="$SEARCH_GPU" \
       retrieval_gpu bash -lc '
         set -euo pipefail
-        cd /workspace/app/retrieval
+        cd /workspace/retrieval
         python3 index_qdrant.py
       '
   fi

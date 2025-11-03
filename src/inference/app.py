@@ -14,7 +14,7 @@ from transformers import AutoModelForVision2Seq, AutoProcessor
 BASE_DIR = Path(__file__).resolve().parent
 STACK_ROOT = Path(os.environ.get("GIS_STACK_ROOT", BASE_DIR.parents[1]))
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", STACK_ROOT / "data"))
-RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", STACK_ROOT / "app" / "results"))
+RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", STACK_ROOT / "results"))
 DEFAULT_MBTILES = os.getenv(
     "DEFAULT_MBTILES", "/workspace/data/rasters/ortho_2017/ortho_2017.mbtiles"
 )

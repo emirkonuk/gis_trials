@@ -7,12 +7,12 @@ services:
     ports:
       - "6333:6333"
     volumes:
-      - ../data/qdrant:/qdrant/storage
+      - ../../data/qdrant:/qdrant/storage
 
   retrieval_gpu:
     build:
       context: ..
-      dockerfile: docker/retrieval.Dockerfile
+      dockerfile: infra/dockerfiles/retrieval.Dockerfile
     image: gis_retrieval:cu124
     container_name: gis_retrieval_gpu
     privileged: true
@@ -27,9 +27,9 @@ services:
       GIS_STACK_ROOT: /workspace
       DATA_ROOT: /workspace/data
     volumes:
-      - ../data:/workspace/data
-      - ../app/retrieval:/workspace/app/retrieval
-      - ../app/models:/workspace/models
-    working_dir: /workspace/app/retrieval
+      - ../../data:/workspace/data
+      - ../../src/retrieval:/workspace/retrieval:ro
+      - ../../data/models:/workspace/models
+    working_dir: /workspace/retrieval
     depends_on:
       - qdrant

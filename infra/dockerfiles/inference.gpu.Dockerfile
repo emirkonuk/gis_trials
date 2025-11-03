@@ -9,13 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace/app/inference
-COPY app/inference/requirements.txt /tmp/requirements.txt
+WORKDIR /workspace/inference
+COPY src/inference/requirements.txt /tmp/requirements.txt
 RUN pip3 install --upgrade pip && \
     pip3 install "torch==2.4.0+cu124" "torchvision==0.19.0+cu124" \
         --extra-index-url https://download.pytorch.org/whl/cu124 && \
     pip3 install -r /tmp/requirements.txt
-COPY app/inference/ /workspace/app/inference/
+COPY src/inference/ /workspace/inference/
 
 EXPOSE 8081
 CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8081"]
