@@ -1,0 +1,33 @@
+Original → New location
+===========================================
+map_serving/docker-compose.yml                         → compose/docker-compose.yml
+map_serving/docker-compose.infer.yml                   → compose/docker-compose.infer.yml
+map_serving/docker-compose.infer.gpu.local.yml         → compose/docker-compose.infer.gpu.local.yml
+map_serving/docker-compose.retrieval.yml               → compose/docker-compose.retrieval.yml
+map_serving/docker/Dockerfile.worker                   → docker/Dockerfile.worker
+map_serving/docker/nginx.conf                          → docker/nginx.conf (paths updated for /workspace layout)
+map_serving/docker/nginx.infer.conf                    → docker/nginx.infer.conf (proxy targets updated)
+map_serving/docker/retrieval.Dockerfile                → docker/retrieval.Dockerfile
+map_serving/docker/inference/Dockerfile                → docker/inference/Dockerfile
+map_serving/docker/inference/app.py                    → app/inference/app.py (rewritten for relative ROOT)
+map_serving/docker/inference/run_tile.py               → app/inference/run_tile.py
+map_serving/docker_mount/project/code/web_preview.html → app/web/web_preview.html
+map_serving/docker_mount/project/code/web_infer.html   → app/web/web_infer.html
+map_serving/docker_mount/project/code/layer_names.json → app/web/layer_names.json
+map_serving/docker_mount/project/code/extract_archives.sh      → scripts/extract_archives.sh (default paths added)
+map_serving/docker_mount/project/code/inventory_extracted.sh   → scripts/inventory_extracted.sh
+map_serving/docker_mount/project/code/build_raster_mosaic.sh   → scripts/build_raster_mosaic.sh
+map_serving/docker_mount/project/code/build_raster_overview.sh → scripts/build_raster_overview.sh
+map_serving/docker_mount/project/code/load_vectors_to_postgis.v2.sh → scripts/load_vectors_to_postgis.v2.sh
+map_serving/docker_mount/project/code/retrieval/chips_make.py  → app/retrieval/chips_make.py (path handling refactored)
+map_serving/docker_mount/project/code/retrieval/embed.py       → app/retrieval/embed.py (path handling refactored)
+map_serving/docker_mount/project/code/retrieval/index_qdrant.py→ app/retrieval/index_qdrant.py (path handling refactored)
+map_serving/docker_mount/project/code/retrieval/search_api.py  → app/retrieval/search_api.py (runtime env support)
+map_serving/docker_mount/project/code/retrieval/config.yaml    → app/retrieval/config.yaml (paths made relative)
+map_serving/docker_mount/project/code/retrieval/requirements.txt → app/retrieval/requirements.txt
+
+Demoted to legacy/
+===========================================
+map_serving/docker_mount/project/code/main.sh → legacy/main.sh
+map_serving/start_stack.sh                    → legacy/start_stack.sh
+map_serving/nuke.sh                           → legacy/nuke.sh

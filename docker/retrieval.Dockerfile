@@ -16,12 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CPLUS_INCLUDE_PATH=/usr/include/gdal \
     CPATH=/usr/include/gdal
 
-WORKDIR /app
-COPY docker_mount/project/code/retrieval/requirements.txt /app/requirements.txt
-RUN python3 -m pip install --upgrade pip && pip install -r /app/requirements.txt
+WORKDIR /workspace/app/retrieval
+COPY app/retrieval/requirements.txt /tmp/requirements.txt
+RUN python3 -m pip install --upgrade pip && pip install -r /tmp/requirements.txt
 
 # Non-root user that matches typical UID 1000; safe in rootless Docker
-RUN useradd -m -u 1000 app && chown -R app:app /app
+RUN useradd -m -u 1000 app && mkdir -p /workspace && chown -R app:app /workspace
 USER app
-WORKDIR /app/retrieval
-ENTRYPOINT ["bash","-lc"]
+WORKDIR /workspace/app/retrieval
+CMD ["bash","-lc","CUDA_VISIBLE_DEVICES=${SEARCH_GPU:-0} python3 -m uvicorn search_api:app --host 0.0.0.0 --port 8099"]

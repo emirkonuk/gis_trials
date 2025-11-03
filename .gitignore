@@ -1,14 +1,13 @@
-# exclude everything under docker_mount...
-docker_mount/**
-# ...but keep project/
-!docker_mount/project/
-# re-exclude everything under project...
-docker_mount/project/**
-# ...but keep code/ and its contents
-!docker_mount/project/code/
-!docker_mount/project/code/**
-# common junk
-*.pyc
+data/
+app/models/
+app/results/
 __pycache__/
-.env
-.DS_Store
+*.pyc
+.bootstrap_tmp/
+.qdrant/
+*.mbtiles
+*.mbtiles.bak
+*.bad.mbtiles
+*.tif
+*.tiff
+notes/*.log

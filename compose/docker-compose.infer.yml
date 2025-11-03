@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/inference.cpu.Dockerfile
+    image: gis_inference_cpu
+    container_name: gis_inference
+    environment:
+      INFER_GPU: ${INFER_GPU:-0}
+      CUDA_VISIBLE_DEVICES: ${INFER_GPU:-0}
+      RESULTS_DIR: /workspace/app/results
+      DATA_ROOT: /workspace/data
+      GIS_STACK_ROOT: /workspace
+    volumes:
+      - ../app:/workspace/app
+      - ../data:/workspace/data
+    ports:
+      - "8081:8081"
+    depends_on:
+      - mbtileserver
+
+  web_infer:
+    image: nginx:alpine
+    container_name: gis_web_infer
+    ports:
+      - "8082:8080"
+    volumes:
+      - ../docker/nginx.infer.conf:/etc/nginx/nginx.conf:ro
+      - ../app/web:/workspace/app/web:ro
+      - ../app/results:/workspace/app/results:ro
+      - ../data:/workspace/data:ro
+    depends_on:
+      - inference
+      - mbtileserver
+      - pgtileserv

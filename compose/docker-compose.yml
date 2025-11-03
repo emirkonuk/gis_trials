@@ -1,0 +1,73 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: gis_db
+    environment:
+      POSTGRES_USER: ${PGUSER:-gis}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-gis}
+      POSTGRES_DB: ${PGDATABASE:-gis}
+    ports:
+      - "${PGHOST_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: gis_worker
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: ${PGUSER:-gis}
+      PGPASSWORD: ${PGPASSWORD:-gis}
+      PGDATABASE: ${PGDATABASE:-gis}
+      SCHEMA: ${PGSCHEMA:-lm}
+      PROJECT: /workspace
+      GIS_STACK_ROOT: /workspace
+    working_dir: /workspace
+    volumes:
+      - ../scripts:/workspace/scripts
+      - ../data:/workspace/data
+      - ../app:/workspace/app
+      - ../legacy:/workspace/legacy:ro
+    depends_on:
+      - db
+
+  pgtileserv:
+    image: pramsey/pg_tileserv:latest
+    container_name: gis_pgtileserv
+    environment:
+      DATABASE_URL: postgresql://${PGUSER:-gis}:${PGPASSWORD:-gis}@db:5432/${PGDATABASE:-gis}
+    ports:
+      - "7800:7800"
+    depends_on:
+      - db
+
+  mbtileserver:
+    image: ghcr.io/consbio/mbtileserver:0.11.0
+    container_name: gis_mbtileserver
+    command: ["-d","/workspace/data/rasters","-p","8090"]
+    volumes:
+      - ../data:/workspace/data:ro
+    ports:
+      - "8090:8090"
+
+  web:
+    image: nginx:alpine
+    container_name: gis_web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../app/web:/workspace/app/web:ro
+      - ../app/results:/workspace/app/results:ro
+      - ../data:/workspace/data:ro
+    depends_on:
+      - pgtileserv
+      - mbtileserver
+
+volumes:
+  pgdata:

@@ -1,145 +1,135 @@
-Here is the README for this phase.
-Save as `/storage/ekonuk_spare/gis/lantmateriet/map_serving/README.md`.
+# GIS Stack
 
----
+This directory reshapes the original `map_serving` tree into a reproducible, flat layout that you can move to any host. Everything is configured to run relative to this folder – no absolute paths and no hidden state.
 
-# GIS Map Serving Stack — Browser + QGIS Access
-
-## Purpose
-
-This phase builds a complete **local web map server** for your Lantmäteriet data.
-It ingests vector and raster archives, loads them into PostGIS, creates color-correct raster mosaics, and exposes everything via browser (MapLibre) and QGIS.
-
-You can now **see, inspect, and query Swedish geospatial layers** as web tiles exactly like any online map, but all running locally.
-
----
-
-## Components
-
-| Layer                | Role               | Exposed at                                     | Description                                                                                                                                         |
-| -------------------- | ------------------ | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **PostGIS (db)**     | Spatial database   | internal only                                  | Stores all vector data (geometry + attributes). Each dataset becomes a table under schema `lm`.                                                     |
-| **pg_tileserv**      | Vector tile server | [http://127.0.0.1:7800](http://127.0.0.1:7800) | Reads from PostGIS and serves each table as **Mapbox Vector Tiles (MVT)**. Each table name appears as a “collection.”                               |
-| **mbtileserver**     | Raster tile server | [http://127.0.0.1:8090](http://127.0.0.1:8090) | Serves prebuilt `.mbtiles` rasters (JPEG pyramids). You can preview at `/services/ortho_2017_demo/map`.                                             |
-| **worker**           | GDAL environment   | internal only                                  | Runs the processing pipeline (`main.sh`): unzips, inventories, loads to PostGIS, builds mosaics, fixes color channels (2-3-3), and creates MBTiles. |
-| **web (Nginx)**      | Unified proxy      | [http://127.0.0.1:8080](http://127.0.0.1:8080) | Serves `web_preview.html`. Proxies `/vector/*` → `pg_tileserv` and `/raster/*` → `mbtileserver` with correct CORS headers.                          |
-| **web_preview.html** | Map viewer         | via 8080                                       | Uses MapLibre to display both raster and vector tiles in the browser. Layer toggles read from `layer_names.json`.                                   |
-
----
-
-## Data Flow
+## Layout
 
 ```
-ZIP archives
-   ↓
-extract_archives.sh
-   ↓
-data/extracted/
-   ↓
-inventory_extracted.sh
-   ↓
-data/inventory/*.txt
-   ↓
-load_vectors_to_postgis.v2.sh  →  PostGIS tables (served by pg_tileserv)
-   ↓
-build_raster_mosaic.sh  →  ortho_2017_seamless.vrt
-   ↓
-build_raster_overview.sh  →  ortho_2017_seamless.vrt.ovr
-   ↓
-gdal_translate (-b 2 -b 3 -b 3)  →  ortho_2017_demo.mbtiles (served by mbtileserver)
+gis-stack/
+  app/            # FastAPI inference, retrieval code, static web assets, model cache
+  compose/        # Docker Compose bundles (core, inference, retrieval)
+  data/           # User- and runtime-managed data; only archives/ must be populated manually
+    archives/     # Drop input ZIP/TAR files here before running bootstrap.sh
+    extracted/    # Created on first bootstrap; contains unpacked inputs
+    rasters/      # Raster mosaics + MBTiles built by the worker image
+    vector/       # Placeholder for derived vectors or exports
+    inventory/    # Text reports created by inventory_extracted.sh
+    chips/        # Retrieval chip pipeline outputs (PNGs, metadata, embeddings)
+    qdrant/       # Persistent storage for the retrieval Qdrant instance
+  docker/         # Dockerfiles and Nginx configs for the stack
+  legacy/         # Original helper scripts kept for reference
+  scripts/        # Data preparation helpers (extraction, inventory, rasters, vectors)
+  bootstrap.sh    # Single entrypoint to build, start, and prepare the stack
+  README.md       # This file
 ```
 
----
+## One-step bootstrap
 
-## How to Run
+1. Copy the official archives (ZIP/TAR) into `./data/archives/`.
+2. From this directory run `./bootstrap.sh`.
+
+`bootstrap.sh` will:
+
+- create any missing runtime folders (`data/extracted`, `data/rasters/ortho_{2011,2017}`, `data/vector`, `data/inventory`, `data/chips`, `data/qdrant`, `app/results`),
+- remove only this project’s containers while preserving any host containers whose names include `skk-mssql` or `serene_almeida`,
+- build all Docker images with `--no-cache` on the first run (use `--force-build` to rebuild later),
+- start core services (Postgres/PostGIS, pg_tileserv, mbtileserver, nginx) followed by inference and retrieval stacks,
+- migrate legacy rasters and retrieval chips from the previous `map_serving` layout when they exist, or rebuild them in-place when they don’t,
+- rebuild mosaics, overviews, and MBTiles for 2011 and 2017 when new data arrives (or when `--force-rasters` is provided); existing `ortho_2017_rgb.tif` and `ortho_{2011,2017}.mbtiles` files are detected and reused,
+- seed or refresh the retrieval pipeline (chips, embeddings, Qdrant index) and verify Qdrant health/point counts; use `--force-retrieval` to regenerate everything,
+- reload vector layers into PostGIS only when they have not been loaded before (remove `data/.vectors_loaded` or pass `--force-vectors` to re-run),
+- run smoke checks (`curl` against mbtileserver, pgtileserv, Nginx search proxy, and a sample raster tile) before printing the key endpoints.
+
+## Adding data later
+
+Drop the new archives into `data/archives/` and rerun `./bootstrap.sh`. The script now detects previously generated deliverables (`ortho_2017_rgb.tif`, MBTiles, `data/.vectors_loaded`, retrieval embeddings) and skips the heavy work unless you explicitly pass `--force-…` flags or remove the corresponding marker files. Extraction still recognises existing folders; run it with `-f` from inside the worker container if you really need to redo the unzip step.
+
+### Running individual pieces
+
+- **Extraction**  
+  `docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/extract_archives.sh'`
+
+- **Inventory**  
+  `docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/inventory_extracted.sh'`
+
+- **Raster rebuild (2011 + 2017 RGB fix)**  
+  `docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/rebuild_rasters.sh'`  
+  (Uses `gdal_translate -b 2 -b 3 -b 3` for 2017 and only rebuilds when `ortho_2017_rgb.tif`/MBTiles are missing; set `GIS_BOOTSTRAP_FORCE_RASTERS=1` to force it.)
+
+- **Vector load**  
+  `rm -f data/.vectors_loaded && docker compose -f compose/docker-compose.yml run --rm worker bash -lc 'scripts/load_vectors_to_postgis.v2.sh'`  
+  (Alternatively run `./bootstrap.sh --force-vectors`.)
+
+- **Tile services only (db + pg_tileserv + mbtileserver + nginx)**  
+  `docker compose -f compose/docker-compose.yml up -d --force-recreate db pgtileserv mbtileserver web`
+
+- **Inference stack only**  
+  `docker compose -f compose/docker-compose.yml -f compose/docker-compose.infer.yml up -d --force-recreate inference web_infer`
+
+- **Retrieval services only (Qdrant + API)**  
+  `docker compose -f compose/docker-compose.retrieval.yml up -d --force-recreate qdrant retrieval_gpu`
+
+- **Retrieval ETL (chips → embeddings → index)**  
+  `docker compose -f compose/docker-compose.retrieval.yml run --rm retrieval_gpu bash -lc 'cd /workspace/app/retrieval && python3 chips_make.py && python3 embed.py && python3 index_qdrant.py'`
+
+- **Stack smoke test (health-gated)**  
+  `./scripts/check_stack.sh`
+
+When raster filenames change, restart only the web-facing services with  
+`docker compose -f compose/docker-compose.yml up -d web web_infer mbtileserver`  
+and rerun `./scripts/check_stack.sh` to confirm the stack. `bootstrap.sh` automatically invokes the same smoke tests at the end of every run and aborts if any endpoint fails.
+
+## GPU assignment
+
+`bootstrap.sh` accepts optional GPU selectors:
+
+```
+./bootstrap.sh --infer-gpu 0 --search-gpu 1
+```
+
+`--infer-gpu` controls the VLM container (`gis_inference`), while `--search-gpu` is passed to the retrieval pipeline and FastAPI search service (`gis_retrieval_gpu`). Both default to `0`. The same values are honoured by the compose files and by the ad-hoc commands that `bootstrap.sh` launches (e.g. the retrieval ETL job).
+
+## Retrieval ETL refresh
+
+The retrieval toolkit lives in `app/retrieval/`. During bootstrap the script will copy the legacy chips/embeddings from `map_serving` when they are present, or rebuild them (`chips_make.py`, `embed.py`, `index_qdrant.py`) if they are missing. You can force a rebuild with `./bootstrap.sh --force-retrieval ...` or trigger individual steps manually:
 
 ```bash
-cd /storage/ekonuk_spare/gis/lantmateriet/map_serving
-bash ./start_stack.sh
+docker compose -f compose/docker-compose.retrieval.yml run --rm \
+  -e SEARCH_GPU=1 -e CUDA_VISIBLE_DEVICES=1 \
+  retrieval_gpu bash -lc 'cd /workspace/app/retrieval && python3 chips_make.py && python3 embed.py && python3 index_qdrant.py'
 ```
 
-This will:
+The FastAPI search service exposed at `/search/text` is defined in `search_api.py` and is proxied through Nginx at `http://127.0.0.1:8082/search/`. `bootstrap.sh` fires a smoke query (`?q=roads&topk=1`) and aborts if the request fails or the Qdrant collection is undersized (< 10 000 points).
 
-1. Build the worker image from `docker/Dockerfile.worker`.
-2. Start all containers.
-3. Run `/project/code/main.sh` inside the worker.
-4. Restart servers and expose them on localhost.
+## Raster layers
 
-After completion:
+Both years now publish separate artifacts under `data/rasters/ortho_{2011,2017}/`. Nginx exposes them at:
 
-* **Web preview:** [http://127.0.0.1:8080](http://127.0.0.1:8080)
-  Raster + vector layers together.
+- `http://127.0.0.1:8082/raster/ortho_2017/tiles/{z}/{x}/{y}.jpg` (RGB; bands 2-3-3)
+- `http://127.0.0.1:8082/raster/ortho_2011/tiles/{z}/{x}/{y}.png`
 
-* **Vector catalog:** [http://127.0.0.1:7800/collections](http://127.0.0.1:7800/collections)
+The web UIs (`web_preview.html`, `web_infer.html`) default to the 2017 RGB mosaic and include a dropdown that toggles the 2011 layer on demand.
 
-* **Raster service JSON:** [http://127.0.0.1:8090/tiles.json](http://127.0.0.1:8090/tiles.json)
+### 2017 raster colour fix
 
----
+The original `ortho_2017_seamless.vrt` referenced missing per-tile VRTs and the previous “RGB” GeoTIFF actually contained grayscale data. The current pipeline rebuilds the MBTiles straight from the raw 2017 GeoTIFF tiles with band order 2-3-3, applies JPEG encoding at 90 % quality, and generates overviews before the tile service starts.
 
-## What Each Output Is
+During bootstrap we rebuild the raster (when new inputs arrive or when `--force-rasters` is used), restart mbtileserver, and run fatal smoke tests:
 
-| File / Folder                              | Meaning                                                        |
-| ------------------------------------------ | -------------------------------------------------------------- |
-| `data/archives/`                           | Original ZIP downloads. Input only.                            |
-| `data/extracted/`                          | Unpacked shapefiles, geopackages, and TIFFs.                   |
-| `data/inventory/*.txt`                     | Lists of extracted datasets used for automation.               |
-| `data/rasters/ortho_2017_seamless.vrt`     | Virtual mosaic of all 2017 orthophotos.                        |
-| `data/rasters/ortho_2017_demo.mbtiles`     | Compressed, color-fixed raster pyramid used by `mbtileserver`. |
-| `data/rasters/ortho_2017_seamless.vrt.ovr` | Overviews for faster reads.                                    |
-| `layer_names.json`                         | Human-readable names for vector tables.                        |
-| `web_preview.html`                         | MapLibre viewer.                                               |
-| `.env`                                     | Database credentials shared across containers.                 |
+1. `curl -sS http://gis_mbtileserver:8090/services | grep ortho_2017`
+2. `curl -s -o /tmp/mb.jpg -w '%{size_download}\n' http://gis_mbtileserver:8090/services/ortho_2017/ortho_2017/tiles/17/72170/38580.jpg`
+3. `curl -s -o /tmp/ng.jpg -w '%{size_download}\n' http://127.0.0.1:8082/raster/ortho_2017/tiles/17/72170/38580.jpg`
 
----
+Each tile probe must return more than 2 000 bytes. Failures print the latest logs from `gis_mbtileserver` and `gis_web_infer` and abort the bootstrap run. You can rerun the same checks on a live stack with `./scripts/check_stack.sh`.
 
-## Using the Outputs in QGIS
+Debug utilities that were used while developing this fix now live in `code/fixes/ortho_2017_rebuild/`. They are optional and kept separate from the main workflow.
 
-### A) Load Raster (MBTiles)
+## Host containers kept alive
 
-1. In QGIS: *Layer → Add Layer → Add Raster Layer…*
-2. Source type: *Database → MBTiles*.
-3. Path:
+`bootstrap.sh` never stops or removes containers whose names include `skk-mssql` or `serene_almeida`, honoring the original requirement. Only containers in this stack with prefixes such as `gis_`, `pgtileserv`, or `mbtileserver` are removed during cleanup.
 
-   ```
-   /storage/ekonuk_spare/gis/lantmateriet/map_serving/docker_mount/project/data/rasters/ortho_2017_demo.mbtiles
-   ```
-4. CRS: EPSG:3857 (Web Mercator) — same as browser view.
+## Notes
 
-### B) Load Vector Layers from PostGIS
-
-1. *Browser panel → PostGIS → New Connection*
-
-   ```
-   Host: localhost
-   Port: 55432
-   Database: gis
-   Username: ekonuk
-   Password: CHANGE_ME_STRONG
-   ```
-2. Click *Connect* → schema `lm`.
-3. Add any table (e.g. `lm.ay_riks`).
-   QGIS will request tiles via SQL directly from the PostGIS instance.
-
-### C) Alternative: Load Vector Tiles via URL
-
-1. *Layer → Add Layer → Add Vector Tile Layer → New URL…*
-2. Enter:
-
-   ```
-   http://127.0.0.1:8080/vector/lm.ay_riks/{z}/{x}/{y}.pbf
-   ```
-3. QGIS will render live MVTs directly from pg_tileserv.
-
----
-
-## Notes for ML Context
-
-* **Raster (MBTiles)**: each tile is a JPEG 256×256 patch of the orthophoto mosaic in RGB order (bands 2-3-3). Perfect for inference, patch extraction, or downstream dataset generation.
-* **Vector (PostGIS)**: geometry + metadata; ideal for semantic supervision (roads, parcels, buildings). You can query by bounding box or join attributes for labeling.
-* **Coordinate Reference System:** EPSG:3857, standard Web Mercator, aligns with online basemaps and most deep-learning tilers.
-* **Pipeline reproducibility:** all transformations run inside the `worker` container, ensuring identical GDAL and PostGIS versions across environments.
-
----
-
-**End of README**
-
+- All Docker Compose files run relative to `gis-stack/`; the project root can be moved or rsynced without editing paths.
+- GPU-specific overrides live in `compose/docker-compose.infer.gpu.local.yml`. If you do not have a GPU, simply omit that file.
+- Legacy scripts from the previous layout reside in `legacy/` with a header noting that they are no longer wired into `bootstrap.sh`.
