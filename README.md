@@ -129,6 +129,33 @@ Each tile probe must return more than 2 000 bytes. Failures print the latest
 
 Debug utilities that were used while developing this fix now live in `code/fixes/ortho_2017_rebuild/`. They are optional and kept separate from the main workflow.
 
+
+## Hemnet crawler
+
+### What it does
+- Loads Hemnet search pages and enqueues listing URLs.
+- Saves **one file per listing**: `data/listings_raw/hemnet/snapshots/<id>/page.mhtml`.
+- Polite defaults: single-threaded, 30–60 s delay between requests, 15–30 min between cycles.
+
+### One-shot run
+Use Compose `run` for a bounded fetch:
+docker compose -f infra/compose/core.yml -f infra/compose/inference.yml -f infra/compose/inference.gpu.local.yml -f infra/compose/retrieval.yml -f infra/compose/crawler.yml run --rm -T crawler \
+  python3 /project/src/crawler/hemnet_crawl.py --max-listings 2 --per-run-cap 2 --sleep-min 30 --sleep-jitter 30
+
+### Daemon mode (recommended)
+Edit `infra/compose/crawler.yml` env values, then:
+docker compose -f infra/compose/core.yml -f infra/compose/inference.yml -f infra/compose/inference.gpu.local.yml -f infra/compose/retrieval.yml -f infra/compose/crawler.yml up -d crawler
+Check logs:
+docker compose ... logs -f crawler
+
+### Tuning
+- Global ceiling: MAX_LISTINGS
+- Per-cycle ceiling: PER_RUN_CAP
+- Request delay: SLEEP_MIN + rand(0..SLEEP_JITTER)
+- Search breadth: PAGES_PER_RUN (0 disables; increase carefully)
+- Cycle delay (daemon): CYCLE_SLEEP_MIN..CYCLE_SLEEP_MAX
+
+
 ## Host containers kept alive
 
 `bootstrap.sh` never stops or removes containers whose names include `skk-mssql` or `serene_almeida`, honoring the original requirement. Only containers in this stack with prefixes such as `gis_`, `pgtileserv`, or `mbtileserver` are removed during cleanup.

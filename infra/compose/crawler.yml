@@ -1,0 +1,38 @@
+services:
+  crawler:
+    build:
+      context: ../../
+      dockerfile: infra/dockerfiles/crawler.Dockerfile
+    image: gis_crawler:playwright
+    working_dir: /project
+    environment:
+      - TZ=Europe/Stockholm
+      # --- Read by orchestrate.py daemon ---
+      - SEED=https://www.hemnet.se/bostader?location_ids[]=17744
+      - MAX_LISTINGS=10000
+      - PER_RUN_CAP=250
+      - SLEEP_MIN=30
+      - SLEEP_JITTER=30
+      - PAGES_PER_RUN=10
+      - CYCLE_SLEEP_MIN=300        # 5 min
+      - CYCLE_SLEEP_MAX=600        # 10 min
+      
+      # --- DB Vars for db_upsert.py ---
+      - PGHOST=db
+      - PGPORT=5432
+      - PGUSER=${PGUSER:-gis}
+      - PGPASSWORD=${PGPASSWORD:-gis}
+      - PGDATABASE=${PGDATABASE:-gis}
+      
+    volumes:
+      - ../../:/project:rw
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2g
+    
+    # --- FIXED COMMAND ---
+    # We only pass the --seed argument. The script will read
+    # PER_RUN_CAP, PAGES_PER_RUN, etc., from the environment.
+    command: python3 /project/src/crawler/orchestrate.py --seed ${SEED}

@@ -158,6 +158,7 @@ wait_for_pg() {
   return 1
 }
 
+
 run_worker() {
   docker compose "${CORE_COMPOSE[@]}" run --rm \
     -e INFER_GPU="$INFER_GPU" \

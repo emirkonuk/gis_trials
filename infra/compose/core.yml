@@ -15,7 +15,7 @@ services:
 
   worker:
     build:
-      context: ..
+      context: ../../
       dockerfile: infra/dockerfiles/worker.Dockerfile
     container_name: gis_worker
     environment:

@@ -11,7 +11,7 @@ services:
 
   retrieval_gpu:
     build:
-      context: ..
+      context: ../../  # <-- 1. THIS FIX IS REQUIRED
       dockerfile: infra/dockerfiles/retrieval.Dockerfile
     image: gis_retrieval:cu124
     container_name: gis_retrieval_gpu
@@ -26,10 +26,24 @@ services:
       TRANSFORMERS_CACHE: /workspace/models
       GIS_STACK_ROOT: /workspace
       DATA_ROOT: /workspace/data
+      
+      # Added Postgres ENVs for the embed_daemon.py
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: ${PGUSER:-gis}
+      PGPASSWORD: ${PGPASSWORD:-gis}
+      PGDATABASE: ${PGDATABASE:-gis}
+      
     volumes:
       - ../../data:/workspace/data
-      - ../../src/retrieval:/workspace/retrieval:ro
+      - ../../src/retrieval:/workspace/retrieval:rw
       - ../../data/models:/workspace/models
     working_dir: /workspace/retrieval
     depends_on:
       - qdrant
+      # 2. REMOVED "db" FROM HERE
+
+    # Modified command to run daemon in background (&) and API in foreground
+    command: >
+      bash -lc "python3 embed_daemon.py &
+                python3 -m uvicorn search_api:app --host 0.0.0.0 --port 8099"

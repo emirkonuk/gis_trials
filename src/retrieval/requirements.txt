@@ -16,3 +16,5 @@ pandas
 requests
 sentencepiece
 pyarrow
+psycopg[binary]
+sentence-transformers
