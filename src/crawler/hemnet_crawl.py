@@ -217,6 +217,12 @@ def save_listing_bundle(page, con, url: str, sleep_min: int, sleep_jitter: int):
         err = repr(e)
 
     finally:
+        # --- FIX: REMOVE THE LISTENER ---
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass # Failsafe in case listener removal fails
+
         # Ensure dom.html exists even on failure
         try:
             if not (root / "dom.html").exists():
