@@ -59,8 +59,8 @@ async def lifespan(app: FastAPI):
     ml_models['clip'] = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
     ml_models['clip_proc'] = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     
-    # FIX: prefer_grpc=False to prevent timeouts on large group-by queries
-    ml_models['qdrant'] = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, prefer_grpc=False)
+    # FIX: Increase timeout to 60s to prevent 'timed out' errors on heavy queries
+    ml_models['qdrant'] = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, prefer_grpc=False, timeout=60)
 
     # 2. Legacy Metadata
     if META_PATH.exists():
@@ -136,7 +136,8 @@ def get_geo_polygon(lat, lon, radius_km):
 def build_qdrant_filter(f: ListingFilters):
     if not f: return None
     conds = []
-    if f.municipality: conds.append(models.FieldCondition(key="municipality", match=models.MatchValue(value=f.municipality)))
+    # Using MatchText for fuzzy municipality matching if it exists
+    if f.municipality: conds.append(models.FieldCondition(key="municipality", match=models.MatchText(text=f.municipality)))
     if f.min_price or f.max_price: conds.append(models.FieldCondition(key="asking_price_sek", range=models.Range(gte=f.min_price, lte=f.max_price)))
     if f.min_rooms: conds.append(models.FieldCondition(key="number_of_rooms", range=models.Range(gte=f.min_rooms)))
     
@@ -156,37 +157,70 @@ def encode_image(q):
         return F.normalize(ml_models['clip'].get_text_features(**inputs), dim=-1).detach().cpu().numpy()[0].tolist()
 
 def llm_parse(query: str):
-    """Robust parser using token slicing."""
+    """Robust parser with cleanup logic for common LLM mistakes."""
     if 'llm' not in ml_models: return {"text_query": query, "image_query": query, "filters": {}}
     
-    # FIX: Balanced example showing both min and max price so the model learns the difference
-    sys_prompt = 'Output ONLY valid JSON. Keys: "text_query", "image_query", "filters" (min_price, max_price, min_rooms). Example: {"text_query": "sea view in Täby", "filters": {"min_price": 2000000, "max_price": 5000000}}'
-    
+    # Improved Prompt: Explicitly handles "below" vs "above" logic
+    sys_prompt = (
+        'You are a JSON parser. Rules:\n'
+        '1. "Below/Under X" -> max_price: X. "Above/Over X" -> min_price: X.\n'
+        '2. Convert "2M" to 2000000.\n'
+        '3. Ignore locations in filters (put in text_query).\n'
+        'Schema: {"text_query": str, "filters": {"min_price": int|null, "max_price": int|null}}.\n'
+        'Example: "Cheap houses under 3M"\n'
+        'Output: {"text_query": "Cheap houses", "filters": {"max_price": 3000000}}'
+    )
     prompt = f"<|system|>\n{sys_prompt}<|end|>\n<|user|>\n{query}<|end|>\n<|assistant|>"
     
     inputs = ml_models['llm_tok'](prompt, return_tensors="pt").to(device)
     input_len = inputs['input_ids'].shape[1]
     
     with torch.inference_mode():
-        # Do not use temperature if do_sample is False
-        out_tokens = ml_models['llm'].generate(**inputs, max_new_tokens=256, do_sample=False, pad_token_id=ml_models['llm_tok'].eos_token_id)
+        out_tokens = ml_models['llm'].generate(**inputs, max_new_tokens=128, do_sample=False, pad_token_id=ml_models['llm_tok'].eos_token_id)
     
     generated_tokens = out_tokens[0][input_len:]
     raw = ml_models['llm_tok'].decode(generated_tokens, skip_special_tokens=True)
     raw_clean = raw.replace("```json", "").replace("```", "").strip()
     
+    log("llm_raw_output", raw=raw)
+
+    data = {"text_query": query, "image_query": query, "filters": {}}
     try:
         match = re.search(r'\{.*\}', raw_clean.replace("\n", " "), re.DOTALL)
         if match:
             candidate = match.group(0)
             try:
-                return json.loads(candidate)
+                parsed = json.loads(candidate)
             except json.JSONDecodeError:
-                return ast.literal_eval(candidate)
+                parsed = ast.literal_eval(candidate)
+            
+            # --- PYTHON LOGIC FIXES (The "Lobotomy") ---
+            # 1. Force location keywords back into text query to use Semantic Search
+            #    (Because the DB column is empty, strict filtering fails)
+            f = parsed.get("filters", {})
+            bad_keys = ["location", "municipality", "area", "city"]
+            
+            # If LLM put a location in filters, move it to text_query
+            for k in bad_keys:
+                if k in f and f[k]:
+                    # Append location to text query if not already there
+                    if f[k] not in parsed.get("text_query", ""):
+                        parsed["text_query"] = f"{parsed.get('text_query', '')} {f[k]}".strip()
+                    # Remove from filters to prevent 0-result DB query
+                    del f[k]
+            
+            parsed["filters"] = f
+            
+            # 2. Sync text and image query
+            if "image_query" not in parsed:
+                parsed["image_query"] = parsed.get("text_query", query)
+                
+            data = parsed
+            
     except Exception as e:
         log("llm_parse_fail", error=str(e), raw=raw)
     
-    return {"text_query": query, "image_query": query, "filters": {}}
+    return data
 
 # --- Endpoints ---
 
@@ -234,6 +268,8 @@ def agent_query(req: AgentQueryRequest):
         params = llm_parse(req.prompt)
         f_data = params.get("filters", {})
         if not isinstance(f_data, dict): f_data = {}
+        # Pydantic will ignore extra keys like "location" if they still exist, 
+        # but our python logic above should have cleaned them.
         f_obj = ListingFilters(**{k: v for k, v in f_data.items() if v is not None})
         
         hybrid_req = HybridSearchRequest(
