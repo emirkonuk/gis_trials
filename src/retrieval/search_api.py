@@ -7,15 +7,14 @@ import torch
 import torch.nn.functional as F
 import psycopg
 import pandas as pd
-import ast
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from transformers import CLIPModel, CLIPProcessor, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import CLIPModel, CLIPProcessor, AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
 
 # --- Config ---
@@ -25,24 +24,28 @@ PG_USER = os.environ.get("PGUSER", "gis")
 PG_PASS = os.environ.get("PGPASSWORD", "gis")
 QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+QDRANT_GRPC_PORT = int(os.environ.get("QDRANT_GRPC_PORT", "6334"))
 
 # Collections
 LISTING_COLLECTION = "hemnet_listings_v1"
 CHIP_COLLECTION = os.environ.get("QDRANT_COLLECTION", "sweden_demo_v0")
 
-# Models
-PHI_MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"
+# --- MODEL CONFIG ---
+# Qwen 2.5 7B Instruct
+LLM_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"
 
 # Paths
 STACK_ROOT = Path(os.environ.get("GIS_STACK_ROOT", Path(__file__).resolve().parents[1]))
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", STACK_ROOT / "data"))
 META_PATH = Path(os.environ.get("METADATA_PATH", DATA_ROOT / "chips" / "metadata.parquet"))
+LLM_CONFIG_PATH = Path(__file__).parent / "llm_config.json"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Globals ---
 ml_models = {}
 legacy_meta = None
+llm_config = {}
 
 def log(event, **kw):
     ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
@@ -51,40 +54,43 @@ def log(event, **kw):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global legacy_meta
+    global legacy_meta, llm_config
     print(f"--- STARTUP: Loading models on {device} ---")
     
+    if LLM_CONFIG_PATH.exists():
+        with open(LLM_CONFIG_PATH, "r") as f:
+            llm_config = json.load(f)
+    else:
+        llm_config = {"system_prompt": "Output JSON.", "examples": []}
+
     # 1. Retrieval Models
     ml_models['text'] = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=device)
     ml_models['clip'] = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
     ml_models['clip_proc'] = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     
-    # timeout=60s to prevent 'timed out' errors on heavy queries
-    ml_models['qdrant'] = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, prefer_grpc=False, timeout=60)
+    ml_models['qdrant'] = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, grpc_port=QDRANT_GRPC_PORT, prefer_grpc=True, timeout=300)
 
     # 2. Legacy Metadata
     if META_PATH.exists():
         print(f"--- STARTUP: Loading legacy metadata from {META_PATH} ---")
         legacy_meta = pd.read_parquet(META_PATH)[["png_path", "lon", "lat"]].reset_index().rename(columns={"index": "row"})
     else:
-        print("--- STARTUP: No legacy metadata found (Legacy search will be empty) ---")
         legacy_meta = pd.DataFrame(columns=["row", "png_path", "lon", "lat"])
 
-    # 3. LLM (Phi-3)
-    print("--- STARTUP: Loading LLM (Phi-3 4-bit)...")
+    # 3. LLM (Qwen 7B - FP16 Mode - Multi-GPU)
+    # We removed BitsAndBytesConfig to run in native Float16.
+    # This requires ~14GB VRAM, which fits across your two 11GB cards (22GB Total).
+    print(f"--- STARTUP: Loading LLM ({LLM_MODEL_ID} FP16)...")
     try:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        ml_models['llm_tok'] = AutoTokenizer.from_pretrained(PHI_MODEL_ID, trust_remote_code=True)
+        ml_models['llm_tok'] = AutoTokenizer.from_pretrained(LLM_MODEL_ID, trust_remote_code=True)
+        if ml_models['llm_tok'].pad_token is None:
+            ml_models['llm_tok'].pad_token = ml_models['llm_tok'].eos_token
+        
         ml_models['llm'] = AutoModelForCausalLM.from_pretrained(
-            PHI_MODEL_ID, 
-            quantization_config=bnb_config, 
-            trust_remote_code=False, 
-            attn_implementation="eager",
-            device_map="auto"
+            LLM_MODEL_ID, 
+            torch_dtype=torch.float16,  # Native FP16 (No quantization errors)
+            device_map="auto",          # Automatically spreads across GPU 0 and GPU 1
+            trust_remote_code=True
         )
         print("--- STARTUP: LLM Ready ---")
     except Exception as e:
@@ -121,13 +127,42 @@ class AgentQueryRequest(BaseModel):
     prompt: str
     topk: int = 10
 
+
+class PostGISRegion(BaseModel):
+    mode: Literal["circle", "none"] = "none"
+    center_lat: Optional[float] = None
+    center_lon: Optional[float] = None
+    radius_km: Optional[float] = None
+
+
+class HardFilters(BaseModel):
+    price_floor_str: Optional[str] = None
+    price_ceiling_str: Optional[str] = None
+    min_rooms_num: Optional[float] = None
+    municipality: Optional[str] = None
+
+
+class QdrantFilterClause(BaseModel):
+    field: Literal["asking_price_sek", "number_of_rooms", "municipality"]
+    type: Literal["range", "match"]
+    gte: Optional[float] = None
+    lte: Optional[float] = None
+    value: Optional[str] = None
+
+
+class LLMIntent(BaseModel):
+    semantic_search: str
+    postgis_region: PostGISRegion = Field(default_factory=PostGISRegion)
+    hard_filters: HardFilters = Field(default_factory=HardFilters)
+    qdrant_filters: List[QdrantFilterClause] = Field(default_factory=list)
+
 # --- Helper Functions ---
+
 def get_geo_polygon(lat, lon, radius_km):
     try:
         conn_str = f"host={PG_HOST} dbname={PG_DB} user={PG_USER} password={PG_PASS}"
         with psycopg.connect(conn_str) as conn:
             with conn.cursor() as cur:
-                # Create a buffer (circle) and return as GeoJSON
                 cur.execute("SELECT ST_AsGeoJSON(ST_Simplify(ST_Buffer(ST_MakePoint(%s, %s)::geography, %s)::geometry, 0.0001));", (lon, lat, radius_km * 1000.0))
                 row = cur.fetchone()
                 return json.loads(row[0]) if row else None
@@ -138,12 +173,16 @@ def get_geo_polygon(lat, lon, radius_km):
 def build_qdrant_filter(f: ListingFilters):
     if not f: return None
     conds = []
-    # Fuzzy match for municipality
-    if f.municipality: conds.append(models.FieldCondition(key="municipality", match=models.MatchText(text=f.municipality)))
-    if f.min_price or f.max_price: conds.append(models.FieldCondition(key="asking_price_sek", range=models.Range(gte=f.min_price, lte=f.max_price)))
-    if f.min_rooms: conds.append(models.FieldCondition(key="number_of_rooms", range=models.Range(gte=f.min_rooms)))
     
-    # PostGIS Geo-Filter
+    if f.municipality: 
+        conds.append(models.FieldCondition(key="municipality", match=models.MatchText(text=f.municipality)))
+        
+    if f.min_price or f.max_price: 
+        conds.append(models.FieldCondition(key="asking_price_sek", range=models.Range(gte=f.min_price, lte=f.max_price)))
+    
+    if f.min_rooms: 
+        conds.append(models.FieldCondition(key="number_of_rooms", range=models.Range(gte=f.min_rooms)))
+    
     if f.center_lat and f.center_lon and f.radius_km:
         poly = get_geo_polygon(f.center_lat, f.center_lon, f.radius_km)
         if poly and poly['type'] == 'Polygon':
@@ -162,96 +201,144 @@ def encode_image(q):
         return F.normalize(ml_models['clip'].get_text_features(**inputs), dim=-1).detach().cpu().numpy()[0].tolist()
 
 def parse_price_string(s: str) -> Optional[int]:
-    """Robustly parse prices like '4M', '4.5M', '4 000 000'."""
     if not s: return None
     if isinstance(s, (int, float)): return int(s)
-    
     clean = s.lower().replace(" ", "").replace(",", ".")
     multiplier = 1
-    
     if "m" in clean or "milj" in clean:
         multiplier = 1_000_000
         clean = re.sub(r"[^\d\.]", "", clean)
     elif "k" in clean:
         multiplier = 1_000
         clean = re.sub(r"[^\d\.]", "", clean)
-        
     try:
         val = float(clean)
         return int(val * multiplier)
     except:
         return None
 
+
+def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the first valid JSON object embedded inside text."""
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def build_qdrant_plan(price_floor: Optional[int], price_ceiling: Optional[int], min_rooms: Optional[float], municipality: Optional[str]) -> List[Dict[str, Any]]:
+    plan: List[Dict[str, Any]] = []
+    if price_floor is not None or price_ceiling is not None:
+        plan.append({
+            "field": "asking_price_sek",
+            "type": "range",
+            "gte": price_floor,
+            "lte": price_ceiling
+        })
+    if min_rooms is not None:
+        plan.append({
+            "field": "number_of_rooms",
+            "type": "range",
+            "gte": float(min_rooms),
+            "lte": None
+        })
+    if municipality:
+        plan.append({
+            "field": "municipality",
+            "type": "match",
+            "value": municipality
+        })
+    return plan
+
 def llm_parse(query: str):
-    """Parses user intent, coordinates, and prices using Python for math."""
     if 'llm' not in ml_models: return {"text_query": query, "image_query": query, "filters": {}}
     
-    # UPDATED PROMPT: Explicitly forbids guessing coordinates for names.
-    sys_prompt = (
-        'You are a parser. Rules:\n'
-        '1. Coordinates: Extract "lat", "lon" ONLY if explicit numbers appear (e.g. "59.3, 18.0").\n'
-        '   - DO NOT convert city names (e.g. "centrum", "Täby") to coordinates. Leave lat/lon null.\n'
-        '2. Prices: Extract RAW strings (e.g. "4M"). Under/Below -> max_price_raw. Over/Above -> min_price_raw.\n'
-        '3. Ignore location names in filters (put in text_query).\n'
-        'Schema: {"text_query": str, "filters": {"min_price_raw": str, "max_price_raw": str, "lat": float, "lon": float, "radius": float}}\n'
-        '\nExamples:\n'
-        'Input: "Houses near 59.3, 18.0 under 5M"\n'
-        'Output: {"text_query": "Houses", "filters": {"max_price_raw": "5M", "lat": 59.3, "lon": 18.0}}\n'
-        'Input: "Apartment in centrum under 2M"\n'
-        'Output: {"text_query": "Apartment in centrum", "filters": {"max_price_raw": "2M", "lat": null, "lon": null}}\n'
-    )
-    prompt = f"<|system|>\n{sys_prompt}<|end|>\n<|user|>\n{query}<|end|>\n<|assistant|>"
+    # --- HOT RELOAD CONFIG ---
+    config = {"system_prompt": "Output JSON.", "examples": []}
+    if LLM_CONFIG_PATH.exists():
+        try:
+            with open(LLM_CONFIG_PATH, "r") as f:
+                config = json.load(f)
+        except Exception as e:
+            log("config_read_error", error=str(e))
+
+    sys_prompt = config.get("system_prompt", "")
+    examples = config.get("examples", [])
     
-    inputs = ml_models['llm_tok'](prompt, return_tensors="pt").to(device)
+    messages = [{"role": "system", "content": sys_prompt}]
+    for ex in examples:
+        messages.append({"role": "user", "content": ex['input']})
+        messages.append({"role": "assistant", "content": json.dumps(ex['output'])})
+    messages.append({"role": "user", "content": query})
+    
+    text = ml_models['llm_tok'].apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = ml_models['llm_tok']([text], return_tensors="pt").to(device)
     input_len = inputs['input_ids'].shape[1]
     
     with torch.inference_mode():
-        out_tokens = ml_models['llm'].generate(**inputs, max_new_tokens=150, do_sample=False, pad_token_id=ml_models['llm_tok'].eos_token_id)
+        out_tokens = ml_models['llm'].generate(
+            **inputs, 
+            max_new_tokens=256, 
+            do_sample=False,
+            pad_token_id=ml_models['llm_tok'].pad_token_id,
+            eos_token_id=ml_models['llm_tok'].eos_token_id
+        )
     
     generated_tokens = out_tokens[0][input_len:]
     raw = ml_models['llm_tok'].decode(generated_tokens, skip_special_tokens=True)
     log("llm_raw_output", raw=raw)
 
-    data = {"text_query": query, "image_query": query, "filters": {}}
+    data = {"text_query": query, "image_query": query, "filters": {}, "llm_plan": None, "qdrant_plan": []}
     
     try:
         raw_clean = raw.replace("```json", "").replace("```", "").strip()
-        match = re.search(r'\{.*\}', raw_clean.replace("\n", " "), re.DOTALL)
-        
-        if match:
-            candidate = match.group(0)
-            try:
-                parsed = json.loads(candidate)
-            except json.JSONDecodeError:
-                parsed = ast.literal_eval(candidate)
-            
-            # --- PYTHON POST-PROCESSING ---
-            f = parsed.get("filters", {})
-            clean_filters = {}
+        parsed = extract_first_json_object(raw_clean)
+        if not parsed:
+            raise ValueError("no_json_object_found")
 
-            # 1. Handle Coordinates
-            if f.get("lat") and f.get("lon"):
-                clean_filters["center_lat"] = float(f["lat"])
-                clean_filters["center_lon"] = float(f["lon"])
-                clean_filters["radius_km"] = float(f.get("radius", 5))
-            
-            # 2. Handle Prices (Python Math)
-            if "min_price_raw" in f:
-                clean_filters["min_price"] = parse_price_string(str(f["min_price_raw"]))
-            if "max_price_raw" in f:
-                clean_filters["max_price"] = parse_price_string(str(f["max_price_raw"]))
-                
-            # 3. Handle Text Query fallback
-            text_q = parsed.get("text_query", query)
-            
-            # 4. Construct Final Object
-            data = {
-                "text_query": text_q,
-                "image_query": text_q,
-                "filters": clean_filters
-            }
-            
-    except Exception as e:
+        intent = LLMIntent(**parsed)
+        hard_filters = intent.hard_filters or HardFilters()
+        text_intent = intent.semantic_search.strip() or query
+
+        clean_filters: Dict[str, Any] = {}
+        price_floor = parse_price_string(hard_filters.price_floor_str)
+        price_ceiling = parse_price_string(hard_filters.price_ceiling_str)
+        if price_floor is not None:
+            clean_filters["min_price"] = price_floor
+        if price_ceiling is not None:
+            clean_filters["max_price"] = price_ceiling
+        if hard_filters.min_rooms_num is not None:
+            clean_filters["min_rooms"] = float(hard_filters.min_rooms_num)
+        if hard_filters.municipality:
+            clean_filters["municipality"] = hard_filters.municipality
+
+        region = intent.postgis_region or PostGISRegion()
+        if region.mode == "circle" and region.center_lat is not None and region.center_lon is not None:
+            radius = region.radius_km if region.radius_km is not None else 5.0
+            clean_filters["center_lat"] = float(region.center_lat)
+            clean_filters["center_lon"] = float(region.center_lon)
+            clean_filters["radius_km"] = float(radius)
+
+        qdrant_plan = build_qdrant_plan(price_floor, price_ceiling, hard_filters.min_rooms_num, hard_filters.municipality)
+
+        data = {
+            "text_query": text_intent,
+            "image_query": text_intent,
+            "filters": clean_filters,
+            "llm_plan": intent.model_dump(),
+            "qdrant_plan": qdrant_plan
+        }
+
+    except (ValidationError, ValueError, TypeError) as e:
         log("llm_parse_fail", error=str(e), raw=raw)
     
     return data
@@ -301,8 +388,6 @@ def agent_query(req: AgentQueryRequest):
     try:
         params = llm_parse(req.prompt)
         f_data = params.get("filters", {})
-        
-        # Pydantic safe parsing
         f_obj = ListingFilters(**{k: v for k, v in f_data.items() if v is not None})
         
         hybrid_req = HybridSearchRequest(
