@@ -27,7 +27,16 @@
     .res-meta { font-size: 11px; color: #666; }
     
     /* Agent Debug */
-    #agent-debug { display: none; margin-top: 5px; padding: 5px; background: #333; color: #0f0; font-size: 10px; border-radius: 3px; }
+    #agent-debug { 
+      display: none;
+      margin-top: 5px; 
+      padding: 5px; 
+      background: #333; 
+      color: #0f0; 
+      font-size: 10px; 
+      border-radius: 3px;
+      white-space: pre-wrap; /* <--- THIS IS THE FIX */
+    }
   </style>
 </head>
 <body>
@@ -88,8 +97,8 @@
     container:'map',
     style:{version:8,sources:{},layers:[]},
     center:[18.064, 59.332], // Central Stockholm
-    zoom:11,
-    minZoom:2,
+    zoom:14,
+    minZoom:13,
     maxZoom:24
   });
 
@@ -128,7 +137,7 @@
     Object.entries(rasterSources).forEach(([year, url]) => {
       const sourceId = `ortho-${year}`;
       const layerId = `${sourceId}-layer`;
-      map.addSource(sourceId,{type:'raster', tiles:[url], tileSize:256, minzoom:0, maxzoom:24});
+      map.addSource(sourceId,{type:'raster', tiles:[url], tileSize:256, minzoom:13, maxzoom:16});
       map.addLayer({id:layerId, type:'raster', source:sourceId, layout:{visibility: year === rasterSelect.value ? 'visible' : 'none'}});
       rasterLayerIds[year] = layerId;
     });
@@ -196,7 +205,7 @@
           geom=(d.geometrytype||'').toLowerCase();
         }catch{}
         const color=colorFor(id);
-        map.addSource(id,{type:'vector',tiles:[`${ORIGIN}/vector/${id}/{z}/{x}/{y}.pbf`],minzoom:0,maxzoom:32});
+        map.addSource(id,{type:'vector',tiles:[`${ORIGIN}/vector/${id}/{z}/{x}/{y}.pbf`],minzoom:13,maxzoom:32});
         if(geom.includes('polygon')){
           map.addLayer({id:`${id}-fill`,type:'fill',source:id,'source-layer':id,paint:{'fill-color':color,'fill-opacity':0.20}});
           map.addLayer({id:`${id}-outline`,type:'line',source:id,'source-layer':id,paint:{'line-color':color,'line-width':2}});

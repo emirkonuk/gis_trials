@@ -58,6 +58,8 @@ async def lifespan(app: FastAPI):
     ml_models['text'] = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=device)
     ml_models['clip'] = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device).eval()
     ml_models['clip_proc'] = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    
+    # FIX: prefer_grpc=False to prevent timeouts on large group-by queries
     ml_models['qdrant'] = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, prefer_grpc=False)
 
     # 2. Legacy Metadata
@@ -157,13 +159,16 @@ def llm_parse(query: str):
     """Robust parser using token slicing."""
     if 'llm' not in ml_models: return {"text_query": query, "image_query": query, "filters": {}}
     
-    sys_prompt = 'Output ONLY valid JSON. Keys: "text_query", "image_query", "filters". Example: {"text_query": "water", "filters": {"min_price": 5000000}}'
+    # FIX: Balanced example showing both min and max price so the model learns the difference
+    sys_prompt = 'Output ONLY valid JSON. Keys: "text_query", "image_query", "filters" (min_price, max_price, min_rooms). Example: {"text_query": "sea view in Täby", "filters": {"min_price": 2000000, "max_price": 5000000}}'
+    
     prompt = f"<|system|>\n{sys_prompt}<|end|>\n<|user|>\n{query}<|end|>\n<|assistant|>"
     
     inputs = ml_models['llm_tok'](prompt, return_tensors="pt").to(device)
     input_len = inputs['input_ids'].shape[1]
     
     with torch.inference_mode():
+        # Do not use temperature if do_sample is False
         out_tokens = ml_models['llm'].generate(**inputs, max_new_tokens=256, do_sample=False, pad_token_id=ml_models['llm_tok'].eos_token_id)
     
     generated_tokens = out_tokens[0][input_len:]
@@ -190,7 +195,6 @@ def search_hybrid(req: HybridSearchRequest):
     q_filter = build_qdrant_filter(req.filters)
     limit = req.topk * 3
     
-    # FIX: Use query_points_groups instead of search_groups
     g_text = ml_models['qdrant'].query_points_groups(
         collection_name=LISTING_COLLECTION, 
         query=encode_text(req.text_query),
@@ -249,14 +253,13 @@ def search_chip_text(q: str, topk: int = 10):
     
     vector = encode_image(q)
     try:
-        # FIX: Use query_points instead of search
         resp = ml_models['qdrant'].query_points(
             collection_name=CHIP_COLLECTION,
             query=vector, 
             limit=topk, 
             with_payload=True
         )
-        results = resp.points # Access the points list
+        results = resp.points
     except Exception as e:
         return {"query": q, "results": [], "error": str(e)}
 
