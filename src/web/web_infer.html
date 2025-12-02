@@ -9,18 +9,25 @@
     html,body{height:100%;margin:0}
     #map{position:absolute; inset:0 360px 0 0}
     #panel{position:absolute; top:0; right:0; width:360px; height:100%; background:#fff; border-left:1px solid #ddd; font:14px system-ui; display:flex; flex-direction:column}
-    #controls{padding:10px; border-bottom:1px solid #eee}
+    #controls{padding:10px; border-bottom:1px solid #eee; background: #fafafa;}
     #layers{padding:10px; border-bottom:1px solid #eee; overflow:auto; max-height:40%}
     #out{flex:1; padding:10px; overflow:auto; background:#fafafa; font-family:ui-monospace,monospace; font-size:12px; white-space:pre-wrap}
     .row{display:flex; align-items:center; gap:6px; margin:6px 0}
     .swatch{width:12px; height:12px; border:1px solid #999; display:inline-block}
     .muted{opacity:.6}
-    button{cursor:pointer}
-    input[type="text"]{width:100%}
-    h4{margin:8px 0 4px 0; font-size:13px; color:#444}
+    button{cursor:pointer; padding: 4px 8px;}
+    input[type="text"]{flex: 1; padding: 4px;}
+    h4{margin:12px 0 4px 0; font-size:13px; color:#444; font-weight:bold; text-transform:uppercase;}
+    
+    /* Result List Styles */
     ul#results{list-style:none; padding:0; margin:8px 0 0 0}
-    ul#results li{padding:6px 4px; border-bottom:1px solid #eee; cursor:pointer}
+    ul#results li{padding:8px 4px; border-bottom:1px solid #eee; cursor:pointer}
     ul#results li:hover{background:#f0f6ff}
+    .res-title { font-weight: bold; display: block; font-size: 13px; }
+    .res-meta { font-size: 11px; color: #666; }
+    
+    /* Agent Debug */
+    #agent-debug { display: none; margin-top: 5px; padding: 5px; background: #333; color: #0f0; font-size: 10px; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -28,13 +35,20 @@
 
   <div id="panel">
     <div id="controls">
-      <!-- Search -->
+      
+      <h4>🏠 Real Estate Agent</h4>
+      <div class="row">
+        <input id="agentInput" type="text" placeholder="e.g. 'Fireplace in Södermalm under 5M'">
+        <button id="btnAgent">Ask</button>
+      </div>
+      <div id="agent-debug"></div>
+
+      <h4>Legacy Tools</h4>
       <div class="row">
         <input id="searchText" type="text" placeholder="Search: e.g. roads near forest edge">
         <button id="btnSearch">Search</button>
       </div>
 
-      <!-- Inference -->
       <div class="row"><input id="prompt" type="text" placeholder="Describe key man-made and natural features."></div>
       <div class="row"><button id="run">Run Inference</button></div>
       <div class="row"><label><input id="use-extent" type="radio" name="bbox" checked> use visible extent</label></div>
@@ -73,8 +87,8 @@
   const map = new maplibregl.Map({
     container:'map',
     style:{version:8,sources:{},layers:[]},
-    center:[18.10,59.35],
-    zoom:14,
+    center:[18.064, 59.332], // Central Stockholm
+    zoom:11,
     minZoom:2,
     maxZoom:24
   });
@@ -93,6 +107,8 @@
     }
   }
   function labelFor(id, fallback){ return NAME_MAP[id] || fallback || id; }
+  
+  // Restored Color Logic
   function colorFor(id){ let h=0; for(let i=0;i<id.length;i++) h=(h*31+id.charCodeAt(i))>>>0; return `hsl(${h%360} 90% 45%)`; }
 
   // tile helpers
@@ -199,7 +215,70 @@
         .forEach(l=>map.setLayoutProperty(l.id,'visibility', show?'visible':'none'));
     }
 
-    // Inference → POST /infer/mbtile → overlay
+    // --- NEW: Real Estate Agent Logic ---
+    document.getElementById('btnAgent').onclick = async () => {
+        const query = document.getElementById('agentInput').value.trim();
+        const debugBox = document.getElementById('agent-debug');
+        const list = document.getElementById('results');
+        const out = document.getElementById('out');
+        
+        if(!query) return;
+        
+        list.innerHTML = '<li class="muted">Thinking... (LLM Parsing)</li>';
+        out.textContent = "Asking Agent...";
+        debugBox.style.display = 'none';
+
+        try {
+            const res = await fetch('/agent/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ prompt: query, topk: 10 })
+            });
+
+            if (!res.ok) throw new Error(`API Error: ${res.statusText}`);
+            const data = await res.json();
+            
+            debugBox.textContent = "Parsed: " + JSON.stringify(data.parsed, null, 2);
+            debugBox.style.display = 'block';
+            
+            list.innerHTML = '';
+            out.textContent = `Found ${data.results.length} listings.`;
+
+            if(!data.results.length) {
+                list.innerHTML = '<li class="muted">No matches found.</li>';
+                return;
+            }
+
+            data.results.forEach((item, idx) => {
+                const p = item.payload;
+                const lat = p.location ? p.location.lat : p.latitude;
+                const lon = p.location ? p.location.lon : p.longitude;
+
+                const li = document.createElement('li');
+                li.innerHTML = `
+                    <span class="res-title">${idx+1}. ${p.street_address || 'Unknown'}</span>
+                    <span class="res-meta">${p.municipality || ''} ${p.asking_price_sek ? '• ' + (p.asking_price_sek/1000000).toFixed(1) + 'M kr' : ''}</span>
+                `;
+                
+                li.onclick = () => {
+                    if (lat && lon) {
+                        if (marker) marker.remove();
+                        marker = new maplibregl.Marker({ color: '#ff4400' }).setLngLat([lon, lat]).addTo(map);
+                        map.flyTo({ center: [lon, lat], zoom: 16 });
+                        out.textContent = `Selected: ${p.street_address}\n${JSON.stringify(p, null, 2)}`;
+                    } else {
+                        alert("No coordinates available.");
+                    }
+                };
+                list.appendChild(li);
+            });
+
+        } catch (e) {
+            list.innerHTML = `<li style="color:red">Error: ${e.message}</li>`;
+        }
+    };
+
+    // Inference Logic (Restored)
     document.getElementById('run').onclick = async ()=>{
       const out = document.getElementById('out');
       const prompt = document.getElementById('prompt').value || "Describe key man-made and natural features.";
@@ -236,8 +315,7 @@
       }catch(e){ out.textContent = 'error: '+ e; }
     };
 
-    // SEARCH: call /search/text and pan/mark
-    const resultsEl = document.getElementById('results');
+    // Legacy Search Logic (Restored)
     document.getElementById('btnSearch').onclick = async ()=>{
       const q = document.getElementById('searchText').value.trim();
       resultsEl.innerHTML = '';
@@ -268,6 +346,10 @@
         map.flyTo({center:[top.lon, top.lat], zoom:17});
       }
     };
+
+    // Shortcuts
+    document.getElementById('agentInput').onkeydown = (e) => { if(e.key === 'Enter') document.getElementById('btnAgent').click(); };
+    document.getElementById('searchText').onkeydown = (e) => { if(e.key === 'Enter') document.getElementById('btnSearch').click(); };
   }
   </script>
 </body>

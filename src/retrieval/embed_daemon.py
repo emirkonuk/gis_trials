@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-embed_daemon.py: Connects to Postgres, pulls unprocessed listings from the
-embedding_queue.
-"""
-
 import json
 import os
 import sys
 import time
 import datetime
-from decimal import Decimal  # <--- ADDED
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -23,17 +18,17 @@ from transformers import AutoModel, AutoProcessor
 try:
     import psycopg
 except ImportError:
-    sys.exit("Error: 'psycopg' library not found. Please (re)build container.")
+    sys.exit("Error: 'psycopg' library not found.")
 
 try:
     from qdrant_client import QdrantClient, models
 except ImportError:
-    sys.exit("Error: 'qdrant-client' library not found. Please (re)build container.")
+    sys.exit("Error: 'qdrant-client' library not found.")
 
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError:
-    sys.exit("Error: 'sentence-transformers' library not found. Please (re)build container.")
+    sys.exit("Error: 'sentence-transformers' library not found.")
 
 # --- Config ---
 PG_HOST = os.environ.get('PGHOST', 'db')
@@ -81,13 +76,11 @@ def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     return chunks[:MAX_TEXT_CHUNKS]
 
 def _make_serializable(data: Dict) -> Dict:
-    """Recursively converts types that JSON/Qdrant hates."""
     clean = {}
     for k, v in data.items():
         if isinstance(v, (datetime.date, datetime.datetime)):
             clean[k] = v.isoformat()
         elif isinstance(v, Decimal):
-            # Convert Decimal to float (or int if it's whole)
             clean[k] = int(v) if v % 1 == 0 else float(v)
         elif isinstance(v, dict):
             clean[k] = _make_serializable(v)
@@ -109,29 +102,56 @@ def load_models() -> Tuple[SentenceTransformer, AutoModel, AutoProcessor]:
         text_model = SentenceTransformer(TEXT_MODEL_NAME, device=DEVICE)
         image_model = AutoModel.from_pretrained(IMAGE_MODEL_NAME, trust_remote_code=True).to(DEVICE).eval()
         image_processor = AutoProcessor.from_pretrained(IMAGE_MODEL_NAME, trust_remote_code=True)
-        log("model_load_success", text_model=TEXT_MODEL_NAME, image_model=IMAGE_MODEL_NAME)
         return text_model, image_model, image_processor
     except Exception as e:
         log("model_load_fail", error=repr(e))
         raise
 
 def ensure_qdrant_collection(client: QdrantClient):
-    """Creates the Qdrant collection ONLY if it does not exist."""
+    """Creates collection and ensures necessary indexes exist."""
     try:
-        # Check if collection exists first
-        if client.collection_exists(QDRANT_COLLECTION):
+        # 1. Create Collection if missing
+        if not client.collection_exists(QDRANT_COLLECTION):
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config={
+                    "text": models.VectorParams(size=TEXT_VECTOR_DIM, distance=models.Distance.COSINE),
+                    "image": models.VectorParams(size=IMAGE_VECTOR_DIM, distance=models.Distance.COSINE),
+                }
+            )
+            log("qdrant_collection_created", collection=QDRANT_COLLECTION)
+        else:
             log("qdrant_collection_exists", collection=QDRANT_COLLECTION)
-            return
 
-        # Create (Safe)
-        client.create_collection(
+        # 2. Ensure Indexes (Idempotent)
+        # Grouping Index (Required for 'group_by')
+        client.create_payload_index(
             collection_name=QDRANT_COLLECTION,
-            vectors_config={
-                "text": models.VectorParams(size=TEXT_VECTOR_DIM, distance=models.Distance.COSINE),
-                "image": models.VectorParams(size=IMAGE_VECTOR_DIM, distance=models.Distance.COSINE),
-            }
+            field_name="listing_id",
+            field_schema=models.PayloadSchemaType.KEYWORD
         )
-        log("qdrant_collection_created", collection=QDRANT_COLLECTION)
+        
+        # Geospatial Indexes (Required for efficient filtering)
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="location", 
+            field_schema=models.PayloadSchemaType.GEO
+        )
+        
+        # Legacy/Fallback indexes (if we still use raw lat/lon ranges)
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="latitude",
+            field_schema=models.PayloadSchemaType.FLOAT
+        )
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="longitude",
+            field_schema=models.PayloadSchemaType.FLOAT
+        )
+        
+        log("qdrant_indexes_ensured")
+
     except Exception as e:
         log("qdrant_init_error", error=repr(e))
 
@@ -165,8 +185,22 @@ def get_data_for_listings(cur: psycopg.Cursor, listing_ids: List[str]) -> Dict[s
         if row_dict.get("description_detailed"):
             data[lid]["texts"].append(row_dict["description_detailed"])
 
-        # Store sanitized attributes
-        data[lid]["attrs"] = _make_serializable(row_dict)
+        # --- NEW: Format Geospatial Data for Qdrant ---
+        # Qdrant requires: "location": { "lat": float, "lon": float }
+        lat = row_dict.get("latitude")
+        lon = row_dict.get("longitude")
+        
+        sanitized_attrs = _make_serializable(row_dict)
+        
+        # Inject the location object if valid coords exist
+        if lat is not None and lon is not None and isinstance(lat, (float, int, Decimal)) and isinstance(lon, (float, int, Decimal)):
+             sanitized_attrs["location"] = {
+                 "lat": float(lat), 
+                 "lon": float(lon)
+             }
+        
+        data[lid]["attrs"] = sanitized_attrs
+        # -----------------------------------------------
 
     # 2. Fetch Images
     cur.execute("""
@@ -177,6 +211,7 @@ def get_data_for_listings(cur: psycopg.Cursor, listing_ids: List[str]) -> Dict[s
     for lid, local_path in cur.fetchall():
         if not local_path.lower().endswith((".jpg", ".jpeg")): continue
         img_name = Path(local_path).name
+        # Map local path to container path
         abs_path = f"/workspace/data/listings_raw/hemnet/snapshots/{lid}/assets/images/{img_name}"
         
         if os.path.exists(abs_path): data[lid]["images"].append(abs_path)

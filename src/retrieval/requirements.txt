@@ -1,7 +1,7 @@
 torch
 torchvision
-transformers
-accelerate
+transformers>=4.41.0
+accelerate>=0.30.0
 fastapi
 uvicorn[standard]
 pillow
@@ -18,3 +18,5 @@ sentencepiece
 pyarrow
 psycopg[binary]
 sentence-transformers
+bitsandbytes
+protobuf

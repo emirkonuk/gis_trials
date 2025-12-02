@@ -35,4 +35,4 @@ services:
     # --- FIXED COMMAND ---
     # We only pass the --seed argument. The script will read
     # PER_RUN_CAP, PAGES_PER_RUN, etc., from the environment.
-    command: python3 /project/src/crawler/orchestrate.py --seed ${SEED}
+    command: python3 /project/src/crawler/orchestrate.py

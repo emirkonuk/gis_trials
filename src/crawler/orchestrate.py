@@ -156,7 +156,8 @@ def is_quiet_time(start_hour=23, end_hour=7) -> bool:
 # --- main: run as a continuous daemon ---
 def main():
     ap = argparse.ArgumentParser(description="Orchestrate Hemnet crawl, parse, and load in a continuous loop.")
-    ap.add_argument("--seed", required=True)
+    # ap.add_argument("--seed", required=True)
+    ap.add_argument("--seed", default=os.environ.get("SEED"), help="Starting URL for the crawl")
     # Read from env vars, falling back to new defaults
     ap.add_argument("--pages-per-run", type=int, default=os.environ.get("PAGES_PER_RUN", 10))
     ap.add_argument("--per-run-cap",  type=int, default=os.environ.get("PER_RUN_CAP", 250))
@@ -167,6 +168,9 @@ def main():
     ap.add_argument("--cycle-sleep-max", type=int, default=os.environ.get("CYCLE_SLEEP_MAX", 600)) # 10 min default
 
     args = ap.parse_args()
+    if not args.seed:
+            log("fatal_error", msg="No SEED provided. Please set SEED env var or pass --seed.")
+            sys.exit(1)
 
     log("daemon_start", **vars(args))
 
