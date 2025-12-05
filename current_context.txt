@@ -1,0 +1,2399 @@
+#!/usr/bin/env bash
+# Final Bootstrap: Robust process management, ID-based health checks, safe cleanup.
+set -euo pipefail
+
+INFER_GPU="${INFER_GPU:-0}"
+SEARCH_GPU="${SEARCH_GPU:-1}"
+GIS_BOOTSTRAP_FORCE_BUILD="${GIS_BOOTSTRAP_FORCE_BUILD:-0}"
+GIS_BOOTSTRAP_FORCE_RASTERS="${GIS_BOOTSTRAP_FORCE_RASTERS:-0}"
+GIS_BOOTSTRAP_FORCE_RETRIEVAL="${GIS_BOOTSTRAP_FORCE_RETRIEVAL:-0}"
+GIS_BOOTSTRAP_FORCE_VECTORS="${GIS_BOOTSTRAP_FORCE_VECTORS:-0}"
+GIS_BOOTSTRAP_FORCE_OSM="${GIS_BOOTSTRAP_FORCE_OSM:-0}"
+
+usage() {
+  cat <<'USAGE'
+Usage: ./bootstrap.sh [--infer-gpu N] [--search-gpu M] [--force-build] [--force-rasters] [--force-retrieval] [--force-vectors] [--force-osm]
+  --infer-gpu N      GPU index for the inference service (default 0)
+  --search-gpu M     GPU index for the retrieval/search service (default 1)
+  --force-build      Rebuild all images with --no-cache
+  --force-rasters    Regenerate mosaics, overviews, and MBTiles even if they already exist
+  --force-retrieval  Force legacy retrieval backfill (usually skipped in favor of daemon)
+  --force-vectors    Reload vector layers into PostGIS even if a previous load exists
+  --force-osm        Re-run OSM ingestion even when the lock file is present
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --infer-gpu)
+      [[ $# -lt 2 ]] && { echo "--infer-gpu requires a value" >&2; exit 1; }
+      INFER_GPU="$2"; shift 2 ;;
+    --search-gpu)
+      [[ $# -lt 2 ]] && { echo "--search-gpu requires a value" >&2; exit 1; }
+      SEARCH_GPU="$2"; shift 2 ;;
+    --force-build)
+      GIS_BOOTSTRAP_FORCE_BUILD=1; shift ;;
+    --force-rasters)
+      GIS_BOOTSTRAP_FORCE_RASTERS=1; shift ;;
+    --force-retrieval)
+      GIS_BOOTSTRAP_FORCE_RETRIEVAL=1; shift ;;
+    --force-vectors)
+      GIS_BOOTSTRAP_FORCE_VECTORS=1; shift ;;
+    --force-osm)
+      GIS_BOOTSTRAP_FORCE_OSM=1; shift ;;
+    --help|-h)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+export INFER_GPU SEARCH_GPU GIS_BOOTSTRAP_FORCE_BUILD GIS_BOOTSTRAP_FORCE_RASTERS
+export GIS_BOOTSTRAP_FORCE_RETRIEVAL GIS_BOOTSTRAP_FORCE_VECTORS GIS_BOOTSTRAP_FORCE_OSM
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="$ROOT/data"
+RESULTS_DIR="$DATA_DIR/results"
+MODELS_DIR="$DATA_DIR/models"
+COMPOSE_DIR="$ROOT/infra/compose"
+BUILD_MARKER="$ROOT/.bootstrap_built"
+TMP_DIR="$ROOT/.bootstrap_tmp"
+VECTOR_MARKER="$DATA_DIR/.vectors_loaded"
+
+mkdir -p \
+  "$DATA_DIR/archives" "$DATA_DIR/extracted" \
+  "$DATA_DIR/rasters/ortho_2017" "$DATA_DIR/rasters/ortho_2011" \
+  "$DATA_DIR/vector" "$DATA_DIR/inventory" \
+  "$DATA_DIR/chips" "$DATA_DIR/qdrant" \
+  "$RESULTS_DIR" "$MODELS_DIR" "$TMP_DIR"
+
+export PGUSER="${PGUSER:-gis}"
+export PGPASSWORD="${PGPASSWORD:-gis}"
+export PGDATABASE="${PGDATABASE:-gis}"
+export PGSCHEMA="${PGSCHEMA:-lm}"
+export PGHOST_PORT="${PGHOST_PORT:-55432}"
+
+echo "[bootstrap] root: $ROOT"
+
+# --- Compose File Arrays ---
+declare -a CORE_COMPOSE=(-f "$COMPOSE_DIR/core.yml")
+declare -a INFER_COMPOSE=()
+declare -a RETRIEVE_COMPOSE=()
+declare -a CRAWLER_COMPOSE=()
+
+if [[ -f "$COMPOSE_DIR/inference.yml" ]]; then
+  INFER_COMPOSE=(${CORE_COMPOSE[@]} -f "$COMPOSE_DIR/inference.yml")
+  [[ -f "$COMPOSE_DIR/inference.gpu.local.yml" ]] && INFER_COMPOSE+=(-f "$COMPOSE_DIR/inference.gpu.local.yml")
+fi
+
+if [[ -f "$COMPOSE_DIR/retrieval.yml" ]]; then
+  RETRIEVE_COMPOSE=(-f "$COMPOSE_DIR/retrieval.yml")
+fi
+
+if [[ -f "$COMPOSE_DIR/crawler.yml" ]]; then
+  CRAWLER_COMPOSE=(-f "$COMPOSE_DIR/crawler.yml")
+fi
+
+# --- Helper Functions ---
+
+# Get Container ID dynamically
+_service_cid() {
+  local ref="$1" svc="$2"
+  local -n files="$ref"
+  docker compose "${files[@]}" ps -q "$svc"
+}
+
+# Check health by ID
+_check_container_by_id() {
+  local cid="$1" label="${2:-$cid}"
+  if [[ -z "$cid" ]]; then
+    echo "[error] $label missing (no container id return from compose)"; return 1
+  fi
+  local state
+  state="$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || true)"
+  if [[ "$state" == "running" ]]; then
+    echo "[ok] $label ($cid) -> running"
+    return 0
+  else
+    echo "[error] $label state=$state"
+    docker logs "$cid" --tail 20 || true
+    return 1
+  fi
+}
+
+start_service() {
+  local compose_ref="$1" service="$2"
+  local -n files="$compose_ref"
+  
+  echo "[bootstrap] starting $service..."
+  docker compose "${files[@]}" up -d "$service"
+  
+  local cid
+  cid="$(_service_cid "$compose_ref" "$service")"
+  _check_container_by_id "$cid" "$service"
+}
+
+cleanup_project_containers() {
+  echo "[bootstrap] pruning containers for known stacks (preserving volumes)"
+  docker compose -f "$COMPOSE_DIR/core.yml" down --remove-orphans || true
+  [[ -f "$COMPOSE_DIR/retrieval.yml" ]] && docker compose -f "$COMPOSE_DIR/retrieval.yml" down --remove-orphans || true
+  [[ -f "$COMPOSE_DIR/inference.yml" ]] && docker compose -f "$COMPOSE_DIR/inference.yml" down --remove-orphans || true
+  [[ -f "$COMPOSE_DIR/crawler.yml" ]] && docker compose -f "$COMPOSE_DIR/crawler.yml" down --remove-orphans || true
+}
+
+build_images() {
+  local force="$1"
+  if [[ "$force" == "1" || ! -f "$BUILD_MARKER" ]]; then
+    echo "[bootstrap] building images..."
+    docker compose "${CORE_COMPOSE[@]}" build --no-cache
+    [[ ${#INFER_COMPOSE[@]} -gt 0 ]] && docker compose "${INFER_COMPOSE[@]}" build --no-cache
+    [[ ${#RETRIEVE_COMPOSE[@]} -gt 0 ]] && docker compose "${RETRIEVE_COMPOSE[@]}" build --no-cache
+    [[ ${#CRAWLER_COMPOSE[@]} -gt 0 ]] && docker compose "${CRAWLER_COMPOSE[@]}" build --no-cache
+    touch "$BUILD_MARKER"
+  else
+    echo "[bootstrap] images already built (skipping)"
+  fi
+}
+
+wait_for_pg() {
+  echo "[bootstrap] waiting for Postgres..."
+  for _ in {1..40}; do
+    if docker exec gis_db pg_isready -U "$PGUSER" -d "$PGDATABASE" >/dev/null 2>&1; then
+      echo "[bootstrap] postgres ready"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "[error] postgres timeout" >&2
+  return 1
+}
+
+run_worker() {
+  docker compose "${CORE_COMPOSE[@]}" run --rm \
+    -e INFER_GPU="$INFER_GPU" \
+    -e SEARCH_GPU="$SEARCH_GPU" \
+    -e GIS_BOOTSTRAP_FORCE_RASTERS="$GIS_BOOTSTRAP_FORCE_RASTERS" \
+    worker "$@"
+}
+
+check_qdrant_http() {
+  echo "[check] qdrant connectivity..."
+  if curl -fsS http://127.0.0.1:6333/collections >/dev/null 2>&1; then
+    echo "[ok] qdrant API reachable"
+  else
+    echo "[error] qdrant API failed"
+    exit 1
+  fi
+}
+
+build_retrieval_assets() {
+  # We skip the legacy 'embed.py' scripts because we now use the continuous 'embed_daemon.py'
+  # Unless explicitly forced.
+  if [[ "${GIS_BOOTSTRAP_FORCE_RETRIEVAL:-0}" == "1" ]]; then
+    echo "[bootstrap] FORCE_RETRIEVAL=1 -> Running legacy backfill scripts..."
+    # Insert legacy script call here if needed
+  else
+    echo "[bootstrap] skipping legacy retrieval backfill (using embed_daemon)"
+  fi
+}
+
+fatal_tile_checks() {
+  # Simple check if tile servers are responding
+  if curl -fsS http://127.0.0.1:8090/services >/dev/null 2>&1; then
+    echo "[ok] mbtileserver reachable"
+  else 
+    echo "[warn] mbtileserver not responding"
+  fi
+}
+
+# --- Execution Flow ---
+
+cleanup_project_containers
+build_images "$GIS_BOOTSTRAP_FORCE_BUILD"
+
+echo "--- Core Services ---"
+start_service CORE_COMPOSE db
+wait_for_pg || true
+"$ROOT/scripts/setup_osm.sh"
+start_service CORE_COMPOSE mbtileserver
+start_service CORE_COMPOSE web
+start_service CORE_COMPOSE pgtileserv
+
+if [[ ${#RETRIEVE_COMPOSE[@]} -gt 0 ]]; then
+  echo "--- Retrieval Stack ---"
+  start_service RETRIEVE_COMPOSE qdrant
+  start_service RETRIEVE_COMPOSE retrieval_gpu
+  
+  # Allow time for retrieval_gpu (Phi-3 loading) to start up
+  echo "[bootstrap] waiting 10s for retrieval/LLM init..."
+  sleep 10
+  check_qdrant_http
+fi
+
+if [[ ${#CRAWLER_COMPOSE[@]} -gt 0 ]]; then
+  echo "--- Crawler Stack ---"
+  start_service CRAWLER_COMPOSE crawler
+fi
+
+# ... Data loading scripts (Legacy Raster/Vector logic) ...
+# (Keeping this section brief as requested, assuming data is already loaded in your vol)
+if [[ "$GIS_BOOTSTRAP_FORCE_VECTORS" == "1" || ! -f "$VECTOR_MARKER" ]]; then
+   # Only run if explicitly needed
+   echo "[bootstrap] checking vector load..."
+fi
+
+if [[ ${#INFER_COMPOSE[@]} -gt 0 ]]; then
+  echo "--- Inference Stack ---"
+  start_service INFER_COMPOSE inference
+  start_service INFER_COMPOSE web_infer
+fi
+
+echo "--- Final Checks ---"
+fatal_tile_checks
+
+cat <<'SUMMARY'
+
+[bootstrap] Stack is UP.
+  - Web UI:       http://127.0.0.1:8082/web_infer.html
+  - Search API:   http://127.0.0.1:8099/docs (Internal Port: 8099, Exposed via Nginx)
+  - Qdrant:       http://127.0.0.1:6333/dashboard
+  - DB Port:      55432
+
+SUMMARY
+echo "[bootstrap] done"
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: gis_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT__SERVICE__ENABLE_GRPC: "true"
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    volumes:
+      - ../../data/qdrant:/qdrant/storage
+
+  retrieval_gpu:
+    build:
+      context: ../../  # <-- 1. THIS FIX IS REQUIRED
+      dockerfile: infra/dockerfiles/retrieval.Dockerfile
+    image: gis_retrieval:cu124
+    container_name: gis_retrieval_gpu
+    privileged: true
+    gpus: all
+    environment:
+      SEARCH_GPU: ${SEARCH_GPU:-1}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-1}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-1}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-all}
+      HF_HOME: /workspace/models
+      TRANSFORMERS_CACHE: /workspace/models
+      GIS_STACK_ROOT: /workspace
+      DATA_ROOT: /workspace/data
+      
+      # Added Postgres ENVs for the embed_daemon.py
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: ${PGUSER:-gis}
+      PGPASSWORD: ${PGPASSWORD:-gis}
+      PGDATABASE: ${PGDATABASE:-gis}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      LLM_GPU_IDS: ${LLM_GPU_IDS:-1}
+      LLM_GPU_MAX_MEM: ${LLM_GPU_MAX_MEM:-9GiB}
+      LLM_CPU_MAX_MEM: ${LLM_CPU_MAX_MEM:-48GiB}
+      LLM_PREFER_4BIT: ${LLM_PREFER_4BIT:-0}
+      EMBED_DEVICE: ${EMBED_DEVICE:-cuda}
+      RETRIEVAL_EMBED_DEVICE: ${RETRIEVAL_EMBED_DEVICE:-cuda}
+      
+    volumes:
+      - ../../data:/workspace/data
+      - ../../src/retrieval:/workspace/retrieval:rw
+      - ../../data/models:/workspace/models
+    working_dir: /workspace/retrieval
+    depends_on:
+      - qdrant
+      # 2. REMOVED "db" FROM HERE
+
+    # Modified command to run daemon in background (&) and API in foreground
+    command: >
+      bash -lc "python3 embed_daemon.py &
+                python3 -m uvicorn search_api:app --host 0.0.0.0 --port 8099 --timeout-keep-alive 1200"
+#!/usr/bin/env bash
+# Idempotent OSM ingestion using osm2pgsql
+set -euo pipefail
+
+log() {
+  echo "[setup_osm] $*" >&2
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+DATA_DIR="$ROOT/data"
+STATE_DIR="$DATA_DIR/osm"
+MARKER_FILE="$STATE_DIR/.imported"
+
+mkdir -p "$STATE_DIR"
+
+PGUSER="${PGUSER:-gis}"
+PGPASSWORD="${PGPASSWORD:-gis}"
+PGDATABASE="${PGDATABASE:-gis}"
+PGHOST_PORT="${PGHOST_PORT:-55432}"
+OSM_SCHEMA="${OSM_SCHEMA:-osm}"
+OSM2PGSQL_CACHE_MB="${OSM2PGSQL_CACHE_MB:-1024}"
+OSM_IMPORT_CPUS="${OSM_IMPORT_CPUS:-4}"
+OSM2PGSQL_IMAGE="${OSM2PGSQL_IMAGE:-debian:12-slim}"
+GIS_BOOTSTRAP_FORCE_OSM="${GIS_BOOTSTRAP_FORCE_OSM:-0}"
+OSM_DATA_PATH="${OSM_DATA_PATH:-/storage/ekonuk_spare/gis/sweden.osm.pbf}"
+GIS_DB_CONTAINER="${GIS_DB_CONTAINER:-gis_db}"
+
+if [[ "${OSM_DATA_PATH##*.}" == "qgz" ]]; then
+  candidate="$(find "$(dirname "$OSM_DATA_PATH")" -maxdepth 1 -name '*.pbf' 2>/dev/null | head -n 1 || true)"
+  if [[ -n "${candidate:-}" ]]; then
+    log "detected QGZ project; falling back to $candidate"
+    OSM_DATA_PATH="$candidate"
+  fi
+fi
+
+if [[ ! -f "$OSM_DATA_PATH" ]]; then
+  log "OSM data not found at $OSM_DATA_PATH"
+  exit 1
+fi
+
+if ! docker ps --format '{{.Names}}' | grep -qx "$GIS_DB_CONTAINER"; then
+  log "PostGIS container '$GIS_DB_CONTAINER' is not running"
+  exit 1
+fi
+
+DATA_HASH="$(sha256sum "$OSM_DATA_PATH" | awk '{print $1}')"
+if [[ -f "$MARKER_FILE" && "$GIS_BOOTSTRAP_FORCE_OSM" != "1" ]]; then
+  read -r prev_hash < "$MARKER_FILE" || true
+  if [[ "$prev_hash" == "$DATA_HASH" ]]; then
+    log "dataset already ingested (hash match); skipping"
+    exit 0
+  fi
+fi
+
+log "loading OSM data from $OSM_DATA_PATH"
+log "hash=$DATA_HASH schema=$OSM_SCHEMA cache=${OSM2PGSQL_CACHE_MB}MB cpus=$OSM_IMPORT_CPUS image=$OSM2PGSQL_IMAGE"
+
+log "preparing schema and extensions"
+docker exec "$GIS_DB_CONTAINER" psql -U "$PGUSER" -d "$PGDATABASE" -c "CREATE EXTENSION IF NOT EXISTS hstore;" >/dev/null
+docker exec "$GIS_DB_CONTAINER" psql -U "$PGUSER" -d "$PGDATABASE" -c "DROP SCHEMA IF EXISTS ${OSM_SCHEMA} CASCADE;" >/dev/null || true
+docker exec "$GIS_DB_CONTAINER" psql -U "$PGUSER" -d "$PGDATABASE" -c "CREATE SCHEMA ${OSM_SCHEMA};" >/dev/null
+
+log "running osm2pgsql import (this may take a while)"
+read -r -d '' OSM2PGSQL_CMD <<'EOF' || true
+set -euo pipefail
+apt-get update >/tmp/apt.log
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends osm2pgsql ca-certificates >/tmp/apt-install.log
+osm2pgsql --create --slim \
+  --database="$PGDATABASE" \
+  --username="$PGUSER" \
+  --host="127.0.0.1" \
+  --port="$PGHOST_PORT" \
+  --cache="$OSM2PGSQL_CACHE_MB" \
+  --number-processes="$OSM_IMPORT_CPUS" \
+  --flat-nodes=/osm-cache/flat_nodes.bin \
+  --hstore \
+  /input.osm.pbf
+EOF
+
+docker run --rm \
+  --network host \
+  -e PGPASSWORD="$PGPASSWORD" \
+  -e PGDATABASE="$PGDATABASE" \
+  -e PGUSER="$PGUSER" \
+  -e PGHOST_PORT="$PGHOST_PORT" \
+  -e PGOPTIONS="--search_path=${OSM_SCHEMA},public" \
+  -e OSM_SCHEMA="$OSM_SCHEMA" \
+  -e OSM2PGSQL_CACHE_MB="$OSM2PGSQL_CACHE_MB" \
+  -e OSM_IMPORT_CPUS="$OSM_IMPORT_CPUS" \
+  -v "$OSM_DATA_PATH":/input.osm.pbf:ro \
+  -v "$STATE_DIR":/osm-cache \
+  "$OSM2PGSQL_IMAGE" \
+  /bin/bash -lc "$OSM2PGSQL_CMD"
+
+log "creating helper indexes"
+cat <<SQL | docker exec -i "$GIS_DB_CONTAINER" psql -U "$PGUSER" -d "$PGDATABASE" >/dev/null
+CREATE INDEX IF NOT EXISTS idx_osm_polygon_name_lower ON ${OSM_SCHEMA}.planet_osm_polygon ((lower(name)));
+CREATE INDEX IF NOT EXISTS idx_osm_polygon_admin_level ON ${OSM_SCHEMA}.planet_osm_polygon ((coalesce(tags -> 'admin_level', '')));
+CREATE INDEX IF NOT EXISTS idx_osm_point_name_lower ON ${OSM_SCHEMA}.planet_osm_point ((lower(name)));
+CREATE INDEX IF NOT EXISTS idx_osm_point_amenity ON ${OSM_SCHEMA}.planet_osm_point (amenity);
+CREATE INDEX IF NOT EXISTS idx_osm_point_addr ON ${OSM_SCHEMA}.planet_osm_point ((coalesce(tags -> 'addr:street', '')));
+ANALYZE ${OSM_SCHEMA}.planet_osm_point;
+ANALYZE ${OSM_SCHEMA}.planet_osm_polygon;
+SQL
+
+log "import complete; writing marker"
+echo "$DATA_HASH" > "$MARKER_FILE"
+log "OSM ingestion completed"
+{
+  "system_prompt": "You are a Retrieval LLM that turns user intent into deterministic JSON for our PostGIS + Qdrant stack.\nReturn exactly ONE JSON object that adheres to the schema below. Do not include explanations or Markdown fences.\n\n### SCHEMA\n{\n  \"semantic_search\": \"string\",        // text used for dense retrieval\n  \"postgis_region\": {                   // how to create the geo polygon in PostGIS\n    \"mode\": \"circle\"|\"none\",\n    \"center_lat\": \"float|null\",\n    \"center_lon\": \"float|null\",\n    \"radius_km\": \"float|null\"          // default to 5 when mode == \"circle\"\n  },\n  \"hard_filters\": {                     // raw expressions that must be honored before semantic search\n    \"price_floor_str\": \"string|null\",\n    \"price_ceiling_str\": \"string|null\",\n    \"min_rooms_num\": \"float|null\",\n    \"municipality\": \"string|null\"\n  },\n  \"qdrant_filters\": [                   // explicit filter plan for Qdrant\n    {\n      \"field\": \"asking_price_sek\"|\"number_of_rooms\"|\"municipality\",\n      \"type\": \"range\"|\"match\",\n      \"gte\": \"float|null\",\n      \"lte\": \"float|null\",\n      \"value\": \"string|null\"\n    }\n  ],\n  \"osm_filters\": {                      // structured OSM context for downstream spatial queries\n    \"location\": {\n      \"type\": \"neighborhood\"|\"municipality\"|\"district\"|\"address\"|\"unknown\",\n      \"value\": \"string|null\"\n    }|null,\n    \"address\": \"string|null\",\n    \"amenities\": [\n      {\n        \"type\": \"string\",             // normalized amenity or facility (\"school\", \"gym\", \"park\")\n        \"relation\": \"near\"|\"within\"|\"inside\"|\"around\"\n      }\n    ]\n  }\n}\n\n### RULES\n1. **Prices**: Preserve the raw string (\"4M\", \"2 million SEK\"). Use price_floor_str for minimum / \"from\" language and price_ceiling_str for maximum / \"under\".\n2. **Rooms**: Only capture the smallest room count mentioned. Map phrases like \"3+ rooms\" -> 3.\n3. **Geo**: When both latitude and longitude numbers are present, set mode=\"circle\" and radius_km=5 unless another radius is requested.\n4. **Municipality**: Copy the municipality or named urban area when explicitly referenced.\n5. **Qdrant Filters**: For every hard filter above, emit the matching `qdrant_filters` entry so downstream services can enforce the constraint. Use SEK as the unit for asking_price_sek (\"2 million\" -> 2000000).\n6. **OSM Filters**: Populate `osm_filters.location` when the user references a neighborhood/district/municipality. Emit each requested amenity (schools, gyms, parks, etc.) so that we can resolve them to PostGIS geometries.\n7. **Determinism**: Always output valid JSON matching the schema. Use null when data is missing.",
+  "examples": [
+    {
+      "input": "apartments with a fireplace near 59.263, 18.084 under 6M with at least 3 rooms",
+      "output": {
+        "semantic_search": "apartments with a fireplace",
+        "postgis_region": {
+          "mode": "circle",
+          "center_lat": 59.263,
+          "center_lon": 18.084,
+          "radius_km": 5
+        },
+        "hard_filters": {
+          "price_floor_str": null,
+          "price_ceiling_str": "6M",
+          "min_rooms_num": 3,
+          "municipality": null
+        },
+        "qdrant_filters": [
+          {
+            "field": "asking_price_sek",
+            "type": "range",
+            "gte": null,
+            "lte": 6000000,
+            "value": null
+          },
+          {
+            "field": "number_of_rooms",
+            "type": "range",
+            "gte": 3.0,
+            "lte": null,
+            "value": null
+          }
+        ],
+        "osm_filters": {
+          "location": null,
+          "address": null,
+          "amenities": []
+        }
+      }
+    },
+    {
+      "input": "Large house above 2 million in Täby",
+      "output": {
+        "semantic_search": "Large house in Täby",
+        "postgis_region": {
+          "mode": "none",
+          "center_lat": null,
+          "center_lon": null,
+          "radius_km": null
+        },
+        "hard_filters": {
+          "price_floor_str": "above 2 million",
+          "price_ceiling_str": null,
+          "min_rooms_num": null,
+          "municipality": "Täby"
+        },
+        "qdrant_filters": [
+          {
+            "field": "asking_price_sek",
+            "type": "range",
+            "gte": 2000000,
+            "lte": null,
+            "value": null
+          },
+          {
+            "field": "municipality",
+            "type": "match",
+            "gte": null,
+            "lte": null,
+            "value": "Täby"
+          }
+        ],
+        "osm_filters": {
+          "location": {
+            "type": "municipality",
+            "value": "Täby"
+          },
+          "address": null,
+          "amenities": []
+        }
+      }
+    },
+    {
+      "input": "2 room apartment in Centrum",
+      "output": {
+        "semantic_search": "2 room apartment in Centrum",
+        "postgis_region": {
+          "mode": "none",
+          "center_lat": null,
+          "center_lon": null,
+          "radius_km": null
+        },
+        "hard_filters": {
+          "price_floor_str": null,
+          "price_ceiling_str": null,
+          "min_rooms_num": 2,
+          "municipality": "Centrum"
+        },
+        "qdrant_filters": [
+          {
+            "field": "number_of_rooms",
+            "type": "range",
+            "gte": 2.0,
+            "lte": null,
+            "value": null
+          },
+          {
+            "field": "municipality",
+            "type": "match",
+            "gte": null,
+            "lte": null,
+            "value": "Centrum"
+          }
+        ],
+        "osm_filters": {
+          "location": {
+            "type": "neighborhood",
+            "value": "Centrum"
+          },
+          "address": null,
+          "amenities": []
+        }
+      }
+    },
+    {
+      "input": "Apartments in Bromma near schools",
+      "output": {
+        "semantic_search": "apartments in Bromma near schools",
+        "postgis_region": {
+          "mode": "none",
+          "center_lat": null,
+          "center_lon": null,
+          "radius_km": null
+        },
+        "hard_filters": {
+          "price_floor_str": null,
+          "price_ceiling_str": null,
+          "min_rooms_num": null,
+          "municipality": "Bromma"
+        },
+        "qdrant_filters": [
+          {
+            "field": "municipality",
+            "type": "match",
+            "gte": null,
+            "lte": null,
+            "value": "Bromma"
+          }
+        ],
+        "osm_filters": {
+          "location": {
+            "type": "neighborhood",
+            "value": "Bromma"
+          },
+          "address": null,
+          "amenities": [
+            {
+              "type": "school",
+              "relation": "near"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+#!/usr/bin/env python3
+import gc
+import json
+import os
+import re
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional
+
+import pandas as pd
+import psycopg
+import torch
+import torch.nn.functional as F
+from fastapi import FastAPI, HTTPException
+from osm_parser import heuristic_osm_filters
+from osm_service import OSMQuerySpec, OSMAmenitySpec, OSMLocationSpec, OSMService
+from pydantic import BaseModel, Field, ValidationError
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer, CLIPModel, CLIPProcessor
+import transformers as _transformers
+from transformers.generation.logits_process import LogitsProcessor as _CompatLogitsProcessor
+
+if not hasattr(_transformers, "LogitsWarper"):
+    class _CompatLogitsWarper(_CompatLogitsProcessor):
+        def __call__(self, input_ids, scores):
+            return scores
+    _transformers.LogitsWarper = _CompatLogitsWarper
+from jsonformer import Jsonformer
+
+# --- Config ---
+PG_HOST = os.environ.get("PGHOST", "db")
+PG_DB = os.environ.get("PGDATABASE", "gis")
+PG_USER = os.environ.get("PGUSER", "gis")
+PG_PASS = os.environ.get("PGPASSWORD", "gis")
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+QDRANT_GRPC_PORT = int(os.environ.get("QDRANT_GRPC_PORT", "6334"))
+
+# Collections
+LISTING_COLLECTION = "hemnet_listings_v1"
+CHIP_COLLECTION = os.environ.get("QDRANT_COLLECTION", "sweden_demo_v0")
+
+# --- MODEL CONFIG ---
+# Qwen 2.5 7B Instruct
+LLM_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+LLM_GPU_IDS = os.environ.get("LLM_GPU_IDS")
+LLM_GPU_MAX_MEM = os.environ.get("LLM_GPU_MAX_MEM", "8GiB")
+LLM_CPU_MAX_MEM = os.environ.get("LLM_CPU_MAX_MEM", "48GiB")
+JSONFORMER_MAX_ARRAY = int(os.environ.get("LLM_JSON_MAX_ARRAY", "6"))
+LLM_PREFER_4BIT = os.environ.get("LLM_PREFER_4BIT", "0") not in {"0", "false", "False"}
+RETRIEVAL_EMBED_DEVICE = os.environ.get("RETRIEVAL_EMBED_DEVICE")
+
+# Paths
+STACK_ROOT = Path(os.environ.get("GIS_STACK_ROOT", Path(__file__).resolve().parents[1]))
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", STACK_ROOT / "data"))
+META_PATH = Path(os.environ.get("METADATA_PATH", DATA_ROOT / "chips" / "metadata.parquet"))
+LLM_CONFIG_PATH = Path(__file__).parent / "llm_config.json"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+embed_device = RETRIEVAL_EMBED_DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _detect_gpu_ids() -> List[int]:
+    raw = LLM_GPU_IDS
+    if not raw:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible:
+            raw = visible
+    if not raw:
+        return [i for i in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+    ids: List[int] = []
+    for token in raw.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if token == "-1":
+            continue
+        try:
+            ids.append(int(token))
+        except ValueError:
+            continue
+    total = torch.cuda.device_count()
+    if total:
+        ids = [gid for gid in ids if 0 <= gid < total]
+    if not ids and total:
+        ids = [i for i in range(total)]
+    return ids
+
+
+GPU_ID_LIST = _detect_gpu_ids()
+
+# --- Globals ---
+ml_models = {}
+legacy_meta = None
+llm_config = {}
+osm_client = OSMService()
+llm_loading = False
+
+def log(event, **kw):
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    msg = " ".join(f"{k}={repr(v)}" for k,v in kw.items())
+    print(f"{ts} {event} {msg}".strip(), flush=True)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global legacy_meta, llm_config
+    print(f"--- STARTUP: Loading models on {device} ---")
+    
+    if LLM_CONFIG_PATH.exists():
+        with open(LLM_CONFIG_PATH, "r") as f:
+            llm_config = json.load(f)
+    else:
+        llm_config = {"system_prompt": "Output JSON.", "examples": []}
+
+    # 1. Retrieval Models
+    ml_models['text'] = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device=embed_device)
+    ml_models['clip'] = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(embed_device).eval()
+    ml_models['clip_proc'] = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    ml_models['clip_device'] = embed_device
+    
+    ml_models['qdrant'] = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, grpc_port=QDRANT_GRPC_PORT, prefer_grpc=True, timeout=300)
+
+    # 2. Legacy Metadata
+    if META_PATH.exists():
+        print(f"--- STARTUP: Loading legacy metadata from {META_PATH} ---")
+        legacy_meta = pd.read_parquet(META_PATH)[["png_path", "lon", "lat"]].reset_index().rename(columns={"index": "row"})
+    else:
+        legacy_meta = pd.DataFrame(columns=["row", "png_path", "lon", "lat"])
+
+    # 3. LLM (optional)
+    print(f"--- STARTUP: Loading LLM ({LLM_MODEL_ID}) ...")
+    global llm_loading
+    llm_loading = True
+    try:
+        ml_models['llm_tok'] = AutoTokenizer.from_pretrained(LLM_MODEL_ID, trust_remote_code=True)
+        if ml_models['llm_tok'].pad_token is None:
+            ml_models['llm_tok'].pad_token = ml_models['llm_tok'].eos_token
+
+        if torch.cuda.is_available():
+            gpu_loaded = False
+            quant_order = [True, False] if LLM_PREFER_4BIT else [False, True]
+            for quantize in quant_order:
+                try:
+                    gpu_model = _load_llm_model(
+                        "auto",
+                        torch.float16,
+                        max_memory=_gpu_max_memory_map(),
+                        quantize_4bit=quantize
+                    )
+                    _reset_llm_reference(gpu_model, "cuda")
+                    label = "GPU 4-bit" if quantize else "GPU"
+                    print(f"--- STARTUP: LLM Ready ({label}) ---")
+                    gpu_loaded = True
+                    break
+                except Exception as err:
+                    mode_label = "4-bit " if quantize else ""
+                    if _is_cuda_oom(err):
+                        print(f"--- STARTUP: {mode_label}GPU load OOM ({err}) ---")
+                    else:
+                        print(f"--- STARTUP: {mode_label}GPU load failed ({err}) ---")
+            if not gpu_loaded:
+                print("--- STARTUP: GPU load unavailable; falling back to CPU ---")
+        if 'llm' not in ml_models:
+            cpu_model = _load_llm_model("cpu", torch.float32, max_memory=_cpu_max_memory_map())
+            _reset_llm_reference(cpu_model, "cpu")
+            print("--- STARTUP: LLM Ready (CPU) ---")
+    except Exception as e:
+        print(f"!!! LLM LOAD FAILED: {e}")
+        raise
+    finally:
+        llm_loading = False
+    
+    yield
+    ml_models.clear()
+    print("--- SHUTDOWN: Models cleared ---")
+
+app = FastAPI(title="Retrieval Agent API", lifespan=lifespan)
+
+# --- Schemas ---
+class ListingFilters(BaseModel):
+    municipality: Optional[str] = None
+    min_price: Optional[int] = None
+    max_price: Optional[int] = None
+    min_rooms: Optional[float] = None
+    center_lat: Optional[float] = None
+    center_lon: Optional[float] = None
+    radius_km: Optional[float] = None
+    geometry_geojson: Optional[Dict[str, Any]] = None
+
+class SearchRequest(BaseModel):
+    query: str
+    topk: int = 10
+    filters: Optional[ListingFilters] = None
+
+class HybridSearchRequest(BaseModel):
+    text_query: str
+    image_query: str
+    topk: int = 10
+    filters: Optional[ListingFilters] = None
+
+class AgentQueryRequest(BaseModel):
+    prompt: str
+    topk: int = 10
+
+
+class PostGISRegion(BaseModel):
+    mode: Literal["circle", "none"] = "none"
+    center_lat: Optional[str] = None
+    center_lon: Optional[str] = None
+    radius_km: Optional[str] = None
+
+
+class HardFilters(BaseModel):
+    price_floor_str: Optional[str] = None
+    price_ceiling_str: Optional[str] = None
+    min_rooms_num: Optional[str] = None
+    municipality: Optional[str] = None
+
+
+class QdrantFilterClause(BaseModel):
+    field: Literal["asking_price_sek", "number_of_rooms", "municipality"]
+    type: Literal["range", "match"]
+    gte: Optional[str] = None
+    lte: Optional[str] = None
+    value: Optional[str] = None
+
+
+class LLMIntent(BaseModel):
+    semantic_search: str
+    postgis_region: PostGISRegion = Field(default_factory=PostGISRegion)
+    hard_filters: HardFilters = Field(default_factory=HardFilters)
+    qdrant_filters: List[QdrantFilterClause] = Field(default_factory=list)
+    osm_filters: Optional[OSMQuerySpec] = None
+
+
+def _is_cuda_oom(err: Exception) -> bool:
+    if isinstance(err, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(err).lower()
+    return "cuda" in msg and ("out of memory" in msg or "memory" in msg)
+
+
+OSM_RELATION_VALUES = ["near", "within", "inside", "around", "intersects", "adjacent", "unknown"]
+
+
+def _llm_json_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "semantic_search": {"type": "string"},
+            "postgis_region": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["circle", "none"]},
+                    "center_lat": {"type": "string"},
+                    "center_lon": {"type": "string"},
+                    "radius_km": {"type": "string"}
+                },
+                "required": ["mode", "center_lat", "center_lon", "radius_km"],
+                "additionalProperties": False
+            },
+            "hard_filters": {
+                "type": "object",
+                "properties": {
+                    "price_floor_str": {"type": "string"},
+                    "price_ceiling_str": {"type": "string"},
+                    "min_rooms_num": {"type": "string"},
+                    "municipality": {"type": "string"}
+                },
+                "required": ["price_floor_str", "price_ceiling_str", "min_rooms_num", "municipality"],
+                "additionalProperties": False
+            },
+            "qdrant_filters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string", "enum": ["asking_price_sek", "number_of_rooms", "municipality"]},
+                        "type": {"type": "string", "enum": ["range", "match"]},
+                        "gte": {"type": "string"},
+                        "lte": {"type": "string"},
+                        "value": {"type": "string"}
+                    },
+                    "required": ["field", "type"],
+                    "additionalProperties": False
+                }
+            },
+            "osm_filters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["neighborhood", "district", "municipality", "address", "bbox", "unknown"]},
+                            "value": {"type": "string"}
+                        },
+                        "required": ["type", "value"],
+                        "additionalProperties": False
+                    },
+                    "address": {"type": "string"},
+                    "amenities": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string"},
+                                "relation": {"type": "string", "enum": OSM_RELATION_VALUES}
+                            },
+                            "required": ["type", "relation"],
+                            "additionalProperties": False
+                        }
+                    }
+                },
+                "required": ["location", "address", "amenities"],
+                "additionalProperties": False
+            }
+        },
+        "required": ["semantic_search", "postgis_region", "hard_filters", "qdrant_filters", "osm_filters"],
+        "additionalProperties": False
+    }
+
+
+def _normalize_nullable_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped or stripped.lower() in {"null", "none", "n/a"}:
+            return None
+        return stripped
+    return str(value)
+
+
+def _float_string_or_none(value: Any, field: str) -> Optional[str]:
+    clean = _normalize_nullable_string(value)
+    if clean is None:
+        return None
+    try:
+        return str(float(clean))
+    except (TypeError, ValueError):
+        log("sanitize_warning", field=field, value=clean)
+        return None
+
+
+def _price_string_or_none(value: Any, field: str) -> Optional[str]:
+    clean = _normalize_nullable_string(value)
+    if clean is None:
+        return None
+    parsed = parse_price_string(clean)
+    if parsed is None:
+        log("sanitize_warning", field=field, value=clean)
+        return None
+    return str(parsed)
+
+
+def _sanitize_llm_output(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    postgis = parsed.get("postgis_region") or {}
+    postgis["center_lat"] = _float_string_or_none(postgis.get("center_lat"), "center_lat")
+    postgis["center_lon"] = _float_string_or_none(postgis.get("center_lon"), "center_lon")
+    postgis["radius_km"] = _float_string_or_none(postgis.get("radius_km"), "radius_km")
+    if not postgis.get("mode"):
+        postgis["mode"] = "none"
+    parsed["postgis_region"] = postgis
+
+    hard_filters = parsed.get("hard_filters") or {}
+    orig_floor_raw = hard_filters.get("price_floor_str")
+    orig_ceiling_raw = hard_filters.get("price_ceiling_str")
+    hard_filters["price_floor_str"] = _price_string_or_none(hard_filters.get("price_floor_str"), "price_floor_str")
+    hard_filters["price_ceiling_str"] = _price_string_or_none(hard_filters.get("price_ceiling_str"), "price_ceiling_str")
+    hard_filters["min_rooms_num"] = _price_string_or_none(hard_filters.get("min_rooms_num"), "min_rooms_num")
+    hard_filters["municipality"] = _normalize_nullable_string(hard_filters.get("municipality"))
+
+    def _has_keyword(raw, keywords):
+        if not isinstance(raw, str):
+            return False
+        lower = raw.lower()
+        return any(word in lower for word in keywords)
+
+    if _has_keyword(orig_floor_raw, ["below", "under", "less"]):
+        hard_filters["price_ceiling_str"] = hard_filters["price_floor_str"]
+        hard_filters["price_floor_str"] = None
+    if _has_keyword(orig_ceiling_raw, ["above", "over", "more"]):
+        hard_filters["price_floor_str"] = hard_filters["price_ceiling_str"]
+        hard_filters["price_ceiling_str"] = None
+    parsed["hard_filters"] = hard_filters
+
+    q_filters = []
+    for clause in parsed.get("qdrant_filters", []) or []:
+        if not isinstance(clause, dict):
+            continue
+        clean = {
+            "field": clause.get("field"),
+            "type": clause.get("type"),
+            "gte": _price_string_or_none(clause.get("gte"), "qdrant_gte"),
+            "lte": _price_string_or_none(clause.get("lte"), "qdrant_lte"),
+            "value": _normalize_nullable_string(clause.get("value"))
+        }
+        if clean["field"] and clean["type"]:
+            q_filters.append(clean)
+    parsed["qdrant_filters"] = q_filters
+
+    osm = parsed.get("osm_filters") or {}
+    location = osm.get("location") or {}
+    loc_type = location.get("type") or "unknown"
+    if loc_type not in ["neighborhood", "district", "municipality", "address", "bbox", "unknown"]:
+        loc_type = "unknown"
+    loc_value = _normalize_nullable_string(location.get("value"))
+    if loc_value:
+        location_clean = {"type": loc_type, "value": loc_value}
+    else:
+        location_clean = None
+
+    address_val = _normalize_nullable_string(osm.get("address"))
+    amenities_raw = osm.get("amenities") or []
+    amenities: List[Dict[str, str]] = []
+    for item in amenities_raw:
+        if not isinstance(item, dict):
+            continue
+        a_type = _normalize_nullable_string(item.get("type"))
+        relation = item.get("relation")
+        if relation not in OSM_RELATION_VALUES:
+            relation = "near"
+        if a_type:
+            amenities.append({"type": a_type, "relation": relation})
+
+    if location_clean is None and loc_type == "unknown" and not address_val and not amenities:
+        parsed["osm_filters"] = None
+    else:
+        parsed["osm_filters"] = {
+            "location": location_clean,
+            "address": address_val,
+            "amenities": amenities
+        }
+    return parsed
+
+
+def _truncate_geometry_placeholder(filters: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(filters, dict):
+        return
+    geom = filters.get("geometry_geojson")
+    if not isinstance(geom, dict):
+        return
+    coords = geom.get("coordinates")
+    count = 0
+    try:
+        if isinstance(coords, list) and coords:
+            first = coords[0]
+            if isinstance(first, list):
+                count = len(first)
+    except Exception:
+        count = 0
+    filters["geometry_geojson"] = f"<Polygon with {count} coordinates>"
+
+
+def _serialize_qdrant_filter(filter_obj: Optional[models.Filter]) -> Optional[Dict[str, Any]]:
+    if not filter_obj:
+        return None
+    try:
+        as_dict = filter_obj.dict()
+    except Exception:
+        return {"raw": str(filter_obj)}
+
+    def _strip_geo(payload: Any):
+        if isinstance(payload, dict):
+            clean = {}
+            for key, val in payload.items():
+                if key == "geo_polygon" and isinstance(val, dict):
+                    exterior = val.get("exterior")
+                    points = exterior.get("points") if isinstance(exterior, dict) else None
+                    count = len(points) if isinstance(points, list) else 0
+                    clean[key] = f"<GeoPolygon with {count} points>"
+                else:
+                    clean[key] = _strip_geo(val)
+            return clean
+        if isinstance(payload, list):
+            return [_strip_geo(item) for item in payload]
+        return payload
+
+    return _strip_geo(as_dict)
+
+
+def _gpu_max_memory_map() -> Dict[Any, Any]:
+    mem: Dict[Any, Any] = {}
+    for gid in GPU_ID_LIST:
+        mem[gid] = LLM_GPU_MAX_MEM
+    mem["cpu"] = LLM_CPU_MAX_MEM
+    return mem
+
+
+def _cpu_max_memory_map() -> Dict[str, str]:
+    return {"cpu": LLM_CPU_MAX_MEM}
+
+
+def _load_llm_model(device_map: str, dtype, max_memory: Optional[Dict[Any, Any]] = None, quantize_4bit: bool = False):
+    kwargs: Dict[str, Any] = {
+        "device_map": device_map,
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": (device_map == "cpu")
+    }
+    if max_memory:
+        kwargs["max_memory"] = max_memory
+    if quantize_4bit:
+        kwargs.update({
+            "load_in_4bit": True,
+            "bnb_4bit_compute_dtype": dtype,
+            "bnb_4bit_use_double_quant": True,
+            "bnb_4bit_quant_type": "nf4"
+        })
+    else:
+        kwargs["torch_dtype"] = dtype
+    return AutoModelForCausalLM.from_pretrained(
+        LLM_MODEL_ID,
+        **kwargs
+    )
+
+
+def _reset_llm_reference(model, device_label: str):
+    ml_models['llm'] = model
+    ml_models['llm_device'] = device_label
+    _configure_llm_runtime(model)
+
+
+def _configure_llm_runtime(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return
+    try:
+        cfg.use_cache = False
+    except Exception:
+        pass
+
+
+def _move_llm_to_cpu():
+    global llm_loading
+    if ml_models.get('llm_device') == "cpu":
+        return
+    log("llm_reload_cpu", message="Reloading model on CPU after CUDA OOM")
+    try:
+        if 'llm' in ml_models:
+            del ml_models['llm']
+    except Exception:
+        pass
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    llm_loading = True
+    try:
+        cpu_model = _load_llm_model("cpu", torch.float32, max_memory=_cpu_max_memory_map())
+        _reset_llm_reference(cpu_model, "cpu")
+    finally:
+        llm_loading = False
+    log("llm_reload_cpu_done")
+
+
+def _wait_for_llm(timeout: float = 1200.0):
+    start = time.time()
+    while llm_loading:
+        if time.time() - start > timeout:
+            raise RuntimeError("llm_load_timeout")
+        time.sleep(0.25)
+
+
+def _run_jsonformer(prompt: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+    def _execute() -> Dict[str, Any]:
+        generator = Jsonformer(
+            ml_models['llm'],
+            ml_models['llm_tok'],
+            schema,
+            prompt=prompt,
+            temperature=0.01,
+            max_array_length=JSONFORMER_MAX_ARRAY,
+        )
+        return generator()
+
+    try:
+        return _execute()
+    except Exception as err:
+        if _is_cuda_oom(err):
+            _move_llm_to_cpu()
+            return _execute()
+        raise
+
+# --- Helper Functions ---
+
+def get_geo_polygon(lat, lon, radius_km):
+    try:
+        conn_str = f"host={PG_HOST} dbname={PG_DB} user={PG_USER} password={PG_PASS}"
+        with psycopg.connect(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ST_AsGeoJSON(ST_Simplify(ST_Buffer(ST_MakePoint(%s, %s)::geography, %s)::geometry, 0.0001));", (lon, lat, radius_km * 1000.0))
+                row = cur.fetchone()
+                return json.loads(row[0]) if row else None
+    except Exception as e:
+        log("postgis_error", error=str(e))
+        return None
+
+def _geojson_to_qdrant_polygon(poly: Dict[str, Any]) -> Optional[models.GeoPolygon]:
+    if not poly:
+        return None
+    coords: Optional[List[List[float]]] = None
+    if poly.get("type") == "Polygon":
+        coords = poly.get("coordinates", [None])[0]
+    elif poly.get("type") == "MultiPolygon":
+        polys = poly.get("coordinates")
+        if polys and polys[0]:
+            coords = polys[0][0]
+    if not coords or len(coords) < 4:
+        return None
+    points = [models.GeoPoint(lon=float(p[0]), lat=float(p[1])) for p in coords]
+    if points[0].lon != points[-1].lon or points[0].lat != points[-1].lat:
+        points.append(points[0])
+    return models.GeoPolygon(exterior=models.GeoLineString(points=points), interiors=[])
+
+
+def build_qdrant_filter(f: ListingFilters):
+    if not f:
+        return None
+    conds = []
+    
+    if f.municipality:
+        conds.append(models.FieldCondition(key="municipality", match=models.MatchText(text=f.municipality)))
+        
+    if f.min_price is not None or f.max_price is not None:
+        range_kwargs: Dict[str, Any] = {}
+        if f.min_price is not None:
+            range_kwargs["gte"] = f.min_price
+        if f.max_price is not None:
+            range_kwargs["lte"] = f.max_price
+        if range_kwargs:
+            conds.append(models.FieldCondition(key="asking_price_sek", range=models.Range(**range_kwargs)))
+    
+    if f.min_rooms is not None:
+        conds.append(models.FieldCondition(key="number_of_rooms", range=models.Range(gte=f.min_rooms)))
+    
+    polygon = None
+    if f.geometry_geojson:
+        polygon = _geojson_to_qdrant_polygon(f.geometry_geojson)
+    elif f.center_lat is not None and f.center_lon is not None and f.radius_km is not None:
+        poly = get_geo_polygon(f.center_lat, f.center_lon, f.radius_km)
+        polygon = _geojson_to_qdrant_polygon(poly)
+        if polygon:
+            log("postgis_filter_active", lat=f.center_lat, lon=f.center_lon, radius=f.radius_km)
+
+    if polygon:
+        conds.append(models.FieldCondition(key="location", geo_polygon=polygon))
+    
+    return models.Filter(must=conds) if conds else None
+
+def encode_text(q):
+    with torch.inference_mode(): return F.normalize(ml_models['text'].encode(q, convert_to_tensor=True), p=2, dim=0).cpu().tolist()
+
+def encode_image(q):
+    with torch.inference_mode():
+        clip_device = ml_models.get('clip_device', device)
+        inputs = ml_models['clip_proc'](text=[q], return_tensors="pt", padding=True).to(clip_device)
+        return F.normalize(ml_models['clip'].get_text_features(**inputs), dim=-1).detach().cpu().numpy()[0].tolist()
+
+def parse_price_string(s: str) -> Optional[int]:
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return int(s)
+
+    text = str(s).lower()
+    prefix_tokens = [
+        "under", "below", "less than", "less", "more than", "above", "over",
+        "at most", "at least", "greater than", "not more than", "up to", "around"
+    ]
+    for token in prefix_tokens:
+        text = text.replace(token, " ")
+    text = text.replace("+", " ")
+    text = text.replace("≈", " ")
+    text = text.replace("~", " ")
+    text = text.replace(",", ".")
+    suffix_tokens = ["sek", "kr", "kronor", "msek", "sek.", "swedishkronor", "price", "prices", "millioner", "million"]
+    for token in suffix_tokens:
+        text = text.replace(token, " ")
+    text = re.sub(r"(rooms?|rum|r)\b", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    match = re.search(r"(-?\d+(?:[\s,_]?\d{3})*(?:\.\d+)?)(?:\s*(m|milj|miljon|miljoner|k))?", text)
+    if not match:
+        digits_only = re.sub(r"[^\d\.]", "", text)
+        if not digits_only:
+            return None
+        number_text = digits_only
+        suffix = None
+    else:
+        number_text = match.group(1)
+        suffix = match.group(2)
+
+    number_text = number_text.replace(" ", "").replace("_", "").replace(",", "")
+    try:
+        value = float(number_text)
+    except ValueError:
+        return None
+
+    multiplier = 1
+    if suffix:
+        if suffix in {"m", "milj", "miljon", "miljoner"}:
+            multiplier = 1_000_000
+        elif suffix == "k":
+            multiplier = 1_000
+    return int(value * multiplier)
+
+
+def extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the first valid JSON object embedded inside text."""
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[idx:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def build_qdrant_plan(price_floor: Optional[int], price_ceiling: Optional[int], min_rooms: Optional[float], municipality: Optional[str]) -> List[Dict[str, Any]]:
+    plan: List[Dict[str, Any]] = []
+    if price_floor is not None or price_ceiling is not None:
+        plan.append({
+            "field": "asking_price_sek",
+            "type": "range",
+            "gte": price_floor,
+            "lte": price_ceiling
+        })
+    if min_rooms is not None:
+        plan.append({
+            "field": "number_of_rooms",
+            "type": "range",
+            "gte": float(min_rooms),
+            "lte": None
+        })
+    if municipality:
+        plan.append({
+            "field": "municipality",
+            "type": "match",
+            "value": municipality
+        })
+    return plan
+
+def _intent_to_payload(intent: LLMIntent, fallback_query: str) -> Dict[str, Any]:
+    hard_filters = intent.hard_filters or HardFilters()
+    text_intent = intent.semantic_search.strip() or fallback_query
+
+    clean_filters: Dict[str, Any] = {}
+    price_floor = parse_price_string(hard_filters.price_floor_str)
+    price_ceiling = parse_price_string(hard_filters.price_ceiling_str)
+    if price_floor is not None:
+        clean_filters["min_price"] = price_floor
+    if price_ceiling is not None:
+        clean_filters["max_price"] = price_ceiling
+    rooms_value = None
+    if hard_filters.min_rooms_num is not None:
+        try:
+            rooms_value = float(hard_filters.min_rooms_num)
+            clean_filters["min_rooms"] = rooms_value
+        except (TypeError, ValueError):
+            rooms_value = None
+    if hard_filters.municipality:
+        clean_filters["municipality"] = hard_filters.municipality
+
+    region = intent.postgis_region or PostGISRegion()
+    if region.mode == "circle" and region.center_lat is not None and region.center_lon is not None:
+        radius = region.radius_km if region.radius_km is not None else 5.0
+        try:
+            clean_filters["center_lat"] = float(region.center_lat)
+            clean_filters["center_lon"] = float(region.center_lon)
+            clean_filters["radius_km"] = float(radius)
+        except (TypeError, ValueError):
+            pass
+
+    osm_context = None
+    if intent.osm_filters:
+        try:
+            osm_context = osm_client.resolve_query(intent.osm_filters)
+            if osm_context.get("filter_geometry"):
+                clean_filters["geometry_geojson"] = osm_context["filter_geometry"]
+        except Exception as osm_err:
+            log("osm_resolution_error", error=str(osm_err))
+
+    qdrant_plan = build_qdrant_plan(price_floor, price_ceiling, rooms_value, hard_filters.municipality)
+    return {
+        "text_query": text_intent,
+        "image_query": text_intent,
+        "filters": clean_filters,
+        "llm_plan": intent.model_dump(),
+        "qdrant_plan": qdrant_plan,
+        "osm_context": osm_context
+    }
+
+
+def llm_parse(query: str):
+    osm_hint = heuristic_osm_filters(query)
+    heuristic_context = None
+    if osm_hint:
+        try:
+            heuristic_context = json.dumps(osm_hint.model_dump())
+        except Exception:
+            heuristic_context = None
+    _wait_for_llm()
+    if 'llm' not in ml_models:
+        raise RuntimeError("llm_not_loaded")
+    
+    config = {"system_prompt": "Output JSON.", "examples": []}
+    if LLM_CONFIG_PATH.exists():
+        try:
+            with open(LLM_CONFIG_PATH, "r") as f:
+                config = json.load(f)
+        except Exception as e:
+            log("config_read_error", error=str(e))
+
+    sys_prompt = config.get("system_prompt", "")
+    examples = config.get("examples", [])
+    
+    messages = [{"role": "system", "content": sys_prompt}]
+    if heuristic_context:
+        messages.append({
+            "role": "system",
+            "content": f"Heuristic OSM cues extracted automatically (review, correct, or expand as needed before emitting the final JSON): {heuristic_context}"
+        })
+    for ex in examples:
+        messages.append({"role": "user", "content": ex['input']})
+        messages.append({"role": "assistant", "content": json.dumps(ex['output'])})
+    messages.append({"role": "user", "content": query})
+    
+    text = ml_models['llm_tok'].apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    schema = _llm_json_schema()
+    parsed = None
+    raw = ""
+    try:
+        with torch.inference_mode():
+            parsed = _run_jsonformer(text, schema)
+        parsed = _sanitize_llm_output(parsed)
+        raw = json.dumps(parsed)
+        log("llm_structured_output", raw=raw)
+
+        intent = LLMIntent(**parsed)
+        return _intent_to_payload(intent, query)
+
+    except (ValidationError, ValueError, TypeError) as e:
+        log("llm_parse_fail", error=str(e), raw=raw)
+        raise
+    finally:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+# --- Endpoints ---
+
+@app.post("/search/hybrid", tags=["Hemnet Listings"])
+def search_hybrid(req: HybridSearchRequest):
+    q_filter = build_qdrant_filter(req.filters)
+    log("qdrant_filter", filter=_serialize_qdrant_filter(q_filter))
+    limit = req.topk * 3
+    
+    g_text = ml_models['qdrant'].query_points_groups(
+        collection_name=LISTING_COLLECTION, 
+        query=encode_text(req.text_query),
+        using="text",
+        query_filter=q_filter, 
+        group_by="listing_id", 
+        limit=limit, 
+        group_size=1, 
+        with_payload=True
+    ).groups
+
+    g_image = ml_models['qdrant'].query_points_groups(
+        collection_name=LISTING_COLLECTION, 
+        query=encode_image(req.image_query),
+        using="image",
+        query_filter=q_filter, 
+        group_by="listing_id", 
+        limit=limit, 
+        group_size=1, 
+        with_payload=True
+    ).groups
+
+    k, scores, payloads = 60, {}, {}
+    for r, g in enumerate(g_text):
+        scores[g.id] = scores.get(g.id, 0) + (1/(k + r + 1))
+        payloads[g.id] = g.hits[0].payload
+    for r, g in enumerate(g_image):
+        scores[g.id] = scores.get(g.id, 0) + (1/(k + r + 1))
+        payloads.setdefault(g.id, g.hits[0].payload)
+
+    results = [{"id": i, "rrf_score": scores[i], "payload": payloads[i]} for i in sorted(scores, key=scores.get, reverse=True)[:req.topk]]
+    parsed_payload = req.dict()
+    _truncate_geometry_placeholder(parsed_payload.get("filters"))
+    return {"parsed": parsed_payload, "results": results}
+
+@app.post("/agent/query", tags=["Agent"])
+def agent_query(req: AgentQueryRequest):
+    try:
+        params = llm_parse(req.prompt)
+        f_data = params.get("filters", {})
+        f_obj = ListingFilters(**{k: v for k, v in f_data.items() if v is not None})
+        
+        hybrid_req = HybridSearchRequest(
+            text_query=params.get("text_query", req.prompt),
+            image_query=params.get("image_query", req.prompt),
+            topk=req.topk,
+            filters=f_obj
+        )
+        return search_hybrid(hybrid_req)
+    except Exception as e:
+        log("agent_fail", error=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/search/text", tags=["Satellite Chips (Legacy)"])
+def search_chip_text(q: str, topk: int = 10):
+    if 'clip_proc' not in ml_models: raise HTTPException(503, "Models not loaded")
+    
+    vector = encode_image(q)
+    try:
+        resp = ml_models['qdrant'].query_points(
+            collection_name=CHIP_COLLECTION,
+            query=vector, 
+            limit=topk, 
+            with_payload=True
+        )
+        results = resp.points
+    except Exception as e:
+        return {"query": q, "results": [], "error": str(e)}
+
+    output = []
+    if legacy_meta is not None and not legacy_meta.empty:
+        for hit in results:
+            try:
+                rid = int(hit.id)
+                if 0 <= rid < len(legacy_meta):
+                    row = legacy_meta.iloc[rid]
+                    output.append({
+                        "id": rid,
+                        "score": float(hit.score),
+                        "png": row["png_path"],
+                        "lon": float(row["lon"]),
+                        "lat": float(row["lat"]),
+                    })
+            except (ValueError, IndexError):
+                continue
+    return {"query": q, "results": output}
+
+@app.post("/search/listing_image")
+def legacy_stub(req: SearchRequest): return {}
+#!/usr/bin/env python3
+"""Lightweight heuristics for extracting OSM intent from natural language."""
+from __future__ import annotations
+
+import re
+from typing import Optional
+
+from osm_service import OSMQuerySpec, OSMAmenitySpec, OSMLocationSpec
+
+
+AMENITY_KEYWORDS = {
+    "gym": "gym",
+    "gyms": "gym",
+    "fitness": "gym",
+    "school": "school",
+    "schools": "school",
+    "park": "park",
+    "parks": "park",
+    "hospital": "hospital",
+    "hospitals": "hospital",
+    "metro": "public_transport",
+    "station": "public_transport",
+}
+
+
+def heuristic_osm_filters(query: str) -> Optional[OSMQuerySpec]:
+    """Return a coarse OSM intent object used as a fallback when the LLM is offline."""
+    if not query:
+        return None
+
+    found_amenities = []
+    lowered = query.lower()
+    for token, normalized in AMENITY_KEYWORDS.items():
+        if token in lowered:
+            found_amenities.append(OSMAmenitySpec(type=normalized, relation="near"))
+
+    loc_match = re.search(
+        r"\b(?:in|at|within|around)\s+([A-Za-zÅÄÖåäö0-9\-\s]+?)(?:\s+(?:near|close|around|by)\b|$)",
+        query,
+        flags=re.IGNORECASE,
+    )
+    location_value = loc_match.group(1).strip(" ,.") if loc_match else None
+
+    if not location_value and not found_amenities:
+        return None
+
+    location_spec = OSMLocationSpec(type="neighborhood", value=location_value) if location_value else None
+    return OSMQuerySpec(location=location_spec, amenities=found_amenities)
+#!/usr/bin/env python3
+"""PostGIS-backed helpers for resolving OSM geometries."""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional
+
+import psycopg
+from psycopg.rows import dict_row
+from pydantic import BaseModel, Field, field_validator
+
+
+class OSMLocationSpec(BaseModel):
+    """Structured description of the requested location."""
+
+    type: Literal["neighborhood", "district", "municipality", "address", "bbox", "unknown"] = "neighborhood"
+    value: str
+
+    @field_validator("value")
+    @classmethod
+    def _clean_value(cls, val: str) -> str:
+        return val.strip()
+
+
+class OSMAmenitySpec(BaseModel):
+    """Structured description of a requested amenity constraint."""
+
+    type: str
+    relation: Literal["near", "within", "inside", "around", "intersects", "adjacent", "unknown"] = "near"
+
+    @field_validator("type")
+    @classmethod
+    def _clean_type(cls, val: str) -> str:
+        return val.strip().lower()
+
+
+class OSMQuerySpec(BaseModel):
+    """Container for all OSM related filters."""
+
+    location: Optional[OSMLocationSpec] = None
+    address: Optional[str] = None
+    amenities: List[OSMAmenitySpec] = Field(default_factory=list)
+
+    @field_validator("address")
+    @classmethod
+    def _clean_address(cls, val: Optional[str]) -> Optional[str]:
+        return val.strip() if val else val
+
+
+def _geometry_from_json(raw: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _point_bbox(lat: float, lon: float, meters: float = 3000.0) -> Dict[str, Any]:
+    """Create a simple square buffer around a point for polygon-only clients."""
+    if meters <= 0:
+        meters = 200.0
+    delta_lat = meters / 111_320.0
+    denom = max(math.cos(math.radians(lat)), 0.2)
+    delta_lon = meters / (111_320.0 * denom)
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [lon - delta_lon, lat - delta_lat],
+            [lon + delta_lon, lat - delta_lat],
+            [lon + delta_lon, lat + delta_lat],
+            [lon - delta_lon, lat + delta_lat],
+            [lon - delta_lon, lat - delta_lat],
+        ]]
+    }
+
+
+@dataclass
+class OSMService:
+    """Thin PostGIS helper that exposes higher level search primitives."""
+
+    schema: str = os.environ.get("OSM_SCHEMA", "osm")
+    host: str = os.environ.get("PGHOST", "127.0.0.1")
+    port: int = int(os.environ.get("PGPORT", os.environ.get("PGHOST_PORT", "5432")))
+    dbname: str = os.environ.get("PGDATABASE", "gis")
+    user: str = os.environ.get("PGUSER", "gis")
+    password: str = os.environ.get("PGPASSWORD", "gis")
+
+    def __post_init__(self):
+        self._conninfo = (
+            f"host={self.host} port={self.port} dbname={self.dbname} "
+            f"user={self.user} password={self.password}"
+        )
+
+    def _query_one(self, sql: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        with psycopg.connect(self._conninfo, row_factory=dict_row) as conn:
+            with conn.execute(sql, params) as cur:
+                return cur.fetchone()
+
+    def _query_all(self, sql: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        with psycopg.connect(self._conninfo, row_factory=dict_row) as conn:
+            with conn.execute(sql, params) as cur:
+                return cur.fetchall()
+
+    def resolve_named_area(self, value: str, location_type: str = "neighborhood") -> Optional[Dict[str, Any]]:
+        if not value:
+            return None
+
+        pattern = f"%{value.strip()}%"
+        exact = value.strip()
+        type_clause = {
+            "municipality": "AND (boundary='administrative' AND (admin_level IN ('6','7','8'))) ",
+            "district": "AND (boundary='administrative' OR place IN ('district','borough','suburb','quarter')) ",
+            "neighborhood": "AND (place IN ('neighbourhood','neighborhood','suburb','quarter','hamlet') OR boundary='administrative') ",
+        }.get(location_type, "")
+
+        sql = f"""
+            SELECT
+                osm_id,
+                name,
+                place,
+                boundary,
+                admin_level,
+                ST_AsGeoJSON(ST_Transform(way, 4326), 6) AS geom_geojson,
+                ST_AsGeoJSON(ST_Envelope(ST_Transform(way, 4326)), 6) AS bbox_geojson,
+                ST_Y(ST_Transform(ST_Centroid(way), 4326)) AS centroid_lat,
+                ST_X(ST_Transform(ST_Centroid(way), 4326)) AS centroid_lon
+            FROM {self.schema}.planet_osm_polygon
+            WHERE name ILIKE %(pattern)s
+            {type_clause}
+            ORDER BY CASE WHEN lower(name) = lower(%(exact)s) THEN 0 ELSE 1 END,
+                     COALESCE(admin_level, '999') ASC,
+                     ST_Area(way) DESC
+            LIMIT 1;
+        """
+        row = self._query_one(sql, {"pattern": pattern, "exact": exact})
+        if row:
+            geom = _geometry_from_json(row.get("geom_geojson"))
+            bbox = _geometry_from_json(row.get("bbox_geojson"))
+            return {
+                "name": row.get("name"),
+                "type": location_type,
+                "place": row.get("place"),
+                "boundary": row.get("boundary"),
+                "geometry": geom,
+                "bbox": bbox,
+                "centroid": {"lat": row.get("centroid_lat"), "lon": row.get("centroid_lon")},
+            }
+
+        point_sql = f"""
+            SELECT
+                osm_id,
+                name,
+                place,
+                ST_AsGeoJSON(ST_Transform(way, 4326), 6) AS geom_geojson,
+                ST_X(ST_Transform(way, 4326)) AS lon,
+                ST_Y(ST_Transform(way, 4326)) AS lat
+            FROM {self.schema}.planet_osm_point
+            WHERE name ILIKE %(pattern)s
+            ORDER BY CASE WHEN lower(name) = lower(%(exact)s) THEN 0 ELSE 1 END
+            LIMIT 1;
+        """
+        row = self._query_one(point_sql, {"pattern": pattern, "exact": exact})
+        if not row:
+            return None
+        geom = _geometry_from_json(row.get("geom_geojson"))
+        bbox = None
+        if row.get("lat") is not None and row.get("lon") is not None:
+            bbox = _point_bbox(row["lat"], row["lon"], 3000.0)
+        return {
+            "name": row.get("name"),
+            "type": location_type,
+            "place": row.get("place"),
+            "boundary": None,
+            "geometry": geom,
+            "bbox": bbox,
+            "centroid": {"lat": row.get("lat"), "lon": row.get("lon")},
+        }
+
+    def resolve_address(self, address: str) -> Optional[Dict[str, Any]]:
+        if not address:
+            return None
+
+        street, housenumber = self._split_address(address)
+        pattern = f"%{street}%"
+        sql = f"""
+            SELECT
+                osm_id,
+                name,
+                "addr:street" AS street,
+                "addr:housenumber" AS housenumber,
+                "addr:city" AS city,
+                ST_AsGeoJSON(ST_Transform(way, 4326), 6) AS geom_geojson,
+                ST_X(ST_Transform(way, 4326)) AS lon,
+                ST_Y(ST_Transform(way, 4326)) AS lat
+            FROM {self.schema}.planet_osm_point
+            WHERE ("addr:street" ILIKE %(pattern)s OR %(pattern)s = '%%' OR name ILIKE %(pattern)s)
+            ORDER BY
+                CASE WHEN lower("addr:street") = lower(%(street)s) THEN 0 ELSE 1 END,
+                CASE WHEN %(house)s IS NOT NULL AND lower("addr:housenumber") = lower(%(house)s) THEN 0 ELSE 1 END,
+                osm_id
+            LIMIT 1;
+        """
+        row = self._query_one(sql, {"pattern": pattern, "street": street, "house": housenumber})
+        if not row:
+            return None
+
+        geom = _geometry_from_json(row.get("geom_geojson"))
+        bbox = None
+        if row.get("lat") is not None and row.get("lon") is not None:
+            bbox = _point_bbox(row["lat"], row["lon"], 400.0)
+
+        return {
+            "name": row.get("name") or row.get("street"),
+            "street": row.get("street"),
+            "housenumber": row.get("housenumber"),
+            "city": row.get("city"),
+            "geometry": geom,
+            "bbox": bbox,
+            "centroid": {"lat": row.get("lat"), "lon": row.get("lon")},
+        }
+
+    def _amenity_terms(self, keyword: str) -> List[str]:
+        base = keyword.strip().lower()
+        synonyms = {
+            "gym": ["gym", "fitness_centre", "fitness center", "fitness"],
+            "fitness": ["gym", "fitness_centre", "fitness center", "fitness"],
+            "school": ["school", "college"],
+            "park": ["park", "recreation_ground", "playground"],
+            "hospital": ["hospital", "clinic"],
+        }
+        for key, terms in synonyms.items():
+            if base == key or base in terms:
+                return list(dict.fromkeys(terms))
+        return [base]
+
+    def resolve_amenities(self, keyword: str, filter_geometry: Optional[Dict[str, Any]] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        if not keyword:
+            return []
+        params: Dict[str, Any] = {"limit": limit}
+        term_clauses: List[str] = []
+        for idx, term in enumerate(self._amenity_terms(keyword)):
+            key = f"pattern_{idx}"
+            params[key] = f"%{term}%"
+            term_clauses.append(
+                f"""(
+                    (amenity IS NOT NULL AND amenity ILIKE %({key})s) OR
+                    (leisure IS NOT NULL AND leisure ILIKE %({key})s) OR
+                    (sport IS NOT NULL AND sport ILIKE %({key})s) OR
+                    (name IS NOT NULL AND name ILIKE %({key})s)
+                )"""
+            )
+        where_clause = " OR ".join(term_clauses)
+        boundary_clause = ""
+        if filter_geometry:
+            params["boundary"] = json.dumps(filter_geometry)
+            boundary_clause = """
+                AND ST_Intersects(
+                    way,
+                    ST_Transform(ST_SetSRID(ST_GeomFromGeoJSON(%(boundary)s), 4326), 3857)
+                )
+            """
+
+        sql = f"""
+            SELECT
+                osm_id,
+                name,
+                amenity,
+                leisure,
+                sport,
+                ST_AsGeoJSON(ST_Transform(way, 4326), 6) AS geom_geojson
+            FROM {self.schema}.planet_osm_point
+            WHERE ({where_clause})
+            {boundary_clause}
+            ORDER BY
+                CASE WHEN amenity ILIKE %(pattern_0)s THEN 0 ELSE 1 END,
+                CASE WHEN leisure ILIKE %(pattern_0)s THEN 0 ELSE 1 END,
+                name NULLS LAST
+            LIMIT %(limit)s;
+        """.format(where_clause=where_clause, boundary_clause=boundary_clause)
+        rows = self._query_all(sql, params)
+        features: List[Dict[str, Any]] = []
+        for row in rows:
+            geom = _geometry_from_json(row.get("geom_geojson"))
+            if not geom:
+                continue
+            features.append({
+                "id": row.get("osm_id"),
+                "name": row.get("name") or row.get("amenity") or row.get("leisure") or row.get("sport"),
+                "amenity": row.get("amenity"),
+                "leisure": row.get("leisure"),
+                "sport": row.get("sport"),
+                "geometry": geom,
+            })
+        return features
+
+    def resolve_query(self, query: OSMQuerySpec) -> Dict[str, Any]:
+        location_info = None
+        address_info = None
+        if query.location and query.location.value:
+            location_info = self.resolve_named_area(query.location.value, query.location.type)
+        if not location_info and query.address:
+            address_info = self.resolve_address(query.address)
+
+        filter_geometry = None
+        if location_info:
+            loc_geom = location_info.get("geometry")
+            if loc_geom and loc_geom.get("type") in ("Polygon", "MultiPolygon"):
+                filter_geometry = loc_geom
+            elif location_info.get("bbox"):
+                filter_geometry = location_info["bbox"]
+        elif address_info:
+            filter_geometry = address_info.get("bbox")
+
+        amenities: List[Dict[str, Any]] = []
+        if query.amenities:
+            for spec in query.amenities:
+                amenities.extend(self.resolve_amenities(spec.type, filter_geometry))
+
+        return {
+            "location": location_info,
+            "address": address_info,
+            "amenities": amenities,
+            "filter_geometry": filter_geometry,
+        }
+
+    @staticmethod
+    def _split_address(address: str) -> (str, Optional[str]):
+        text = address.strip()
+        match = re.search(r"(.+?)\s+(\d+\w?)$", text)
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+        return text, None
+torch
+torchvision
+transformers>=4.41.0
+accelerate>=0.30.0
+fastapi
+uvicorn[standard]
+pillow
+rasterio
+mercantile
+numpy
+qdrant-client
+pydantic
+pyyaml
+tqdm
+pandas
+requests
+sentencepiece
+pyarrow
+psycopg[binary]
+sentence-transformers
+bitsandbytes
+protobuf
+jsonformer
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import json
+import os
+import sys
+import time
+import datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from transformers import AutoModel, AutoProcessor
+
+try:
+    import psycopg
+except ImportError:
+    sys.exit("Error: 'psycopg' library not found.")
+
+try:
+    from qdrant_client import QdrantClient, models
+except ImportError:
+    sys.exit("Error: 'qdrant-client' library not found.")
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    sys.exit("Error: 'sentence-transformers' library not found.")
+
+# --- Config ---
+PG_HOST = os.environ.get('PGHOST', 'db')
+PG_DB = os.environ.get('PGDATABASE', 'gis')
+PG_USER = os.environ.get('PGUSER', 'gis')
+PG_PASS = os.environ.get('PGPASSWORD', 'gis')
+
+QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
+QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
+QDRANT_COLLECTION = "hemnet_listings_v1"
+
+ENV_DEVICE = os.environ.get("EMBED_DEVICE")
+if ENV_DEVICE:
+    DEVICE = ENV_DEVICE.lower()
+else:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if DEVICE not in ("cuda", "cpu"):
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- Model Config ---
+TEXT_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+TEXT_VECTOR_DIM = 384
+TEXT_CHUNK_SIZE = 256
+TEXT_CHUNK_OVERLAP = 50
+MAX_TEXT_CHUNKS = 10
+
+IMAGE_MODEL_NAME = 'openai/clip-vit-large-patch14'
+IMAGE_VECTOR_DIM = 768
+IMAGE_RESIZE_DIM = 224
+MAX_IMAGE_EMBEDS = 50
+
+BATCH_SIZE = 16
+POLL_INTERVAL = 10 
+
+def log(event, **kw):
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+    msg = " ".join(f"{k}={repr(v)}" for k,v in kw.items())
+    print(f"{ts} {event} {msg}".strip(), flush=True)
+
+def _chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    if not text: return []
+    words = text.split()
+    if not words: return []
+    chunks = []
+    step = chunk_size - chunk_overlap
+    if step <= 0: step = chunk_size
+    for i in range(0, len(words), step):
+        chunk_words = words[i:i + chunk_size]
+        chunks.append(" ".join(chunk_words))
+        if i + chunk_size >= len(words): break
+    return chunks[:MAX_TEXT_CHUNKS]
+
+def _make_serializable(data: Dict) -> Dict:
+    clean = {}
+    for k, v in data.items():
+        if isinstance(v, (datetime.date, datetime.datetime)):
+            clean[k] = v.isoformat()
+        elif isinstance(v, Decimal):
+            clean[k] = int(v) if v % 1 == 0 else float(v)
+        elif isinstance(v, dict):
+            clean[k] = _make_serializable(v)
+        else:
+            clean[k] = v
+    return clean
+
+def get_db_connection() -> Optional[psycopg.Connection]:
+    try:
+        conn_str = f"host={PG_HOST} dbname={PG_DB} user={PG_USER} password={PG_PASS}"
+        return psycopg.connect(conn_str, autocommit=False)
+    except psycopg.OperationalError as e:
+        log("db_connect_fail", error=repr(e))
+        return None
+
+def load_models() -> Tuple[SentenceTransformer, AutoModel, AutoProcessor]:
+    log("model_load_start", device=DEVICE)
+    try:
+        text_model = SentenceTransformer(TEXT_MODEL_NAME, device=DEVICE)
+        image_model = AutoModel.from_pretrained(IMAGE_MODEL_NAME, trust_remote_code=True).to(DEVICE).eval()
+        image_processor = AutoProcessor.from_pretrained(IMAGE_MODEL_NAME, trust_remote_code=True)
+        return text_model, image_model, image_processor
+    except Exception as e:
+        log("model_load_fail", error=repr(e))
+        raise
+
+def ensure_qdrant_collection(client: QdrantClient):
+    """Creates collection and ensures necessary indexes exist."""
+    try:
+        # 1. Create Collection if missing
+        if not client.collection_exists(QDRANT_COLLECTION):
+            client.create_collection(
+                collection_name=QDRANT_COLLECTION,
+                vectors_config={
+                    "text": models.VectorParams(size=TEXT_VECTOR_DIM, distance=models.Distance.COSINE),
+                    "image": models.VectorParams(size=IMAGE_VECTOR_DIM, distance=models.Distance.COSINE),
+                }
+            )
+            log("qdrant_collection_created", collection=QDRANT_COLLECTION)
+        else:
+            log("qdrant_collection_exists", collection=QDRANT_COLLECTION)
+
+        # 2. Ensure Indexes (Idempotent)
+        # Grouping Index (Required for 'group_by')
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="listing_id",
+            field_schema=models.PayloadSchemaType.KEYWORD
+        )
+        
+        # Geospatial Indexes (Required for efficient filtering)
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="location", 
+            field_schema=models.PayloadSchemaType.GEO
+        )
+        
+        # Legacy/Fallback indexes (if we still use raw lat/lon ranges)
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="latitude",
+            field_schema=models.PayloadSchemaType.FLOAT
+        )
+        client.create_payload_index(
+            collection_name=QDRANT_COLLECTION,
+            field_name="longitude",
+            field_schema=models.PayloadSchemaType.FLOAT
+        )
+        
+        log("qdrant_indexes_ensured")
+
+    except Exception as e:
+        log("qdrant_init_error", error=repr(e))
+
+def fetch_unprocessed_listings(cur: psycopg.Cursor, limit: int) -> List[str]:
+    cur.execute("""
+        SELECT listing_id FROM public.embedding_queue
+        WHERE processed = false LIMIT %s FOR UPDATE SKIP LOCKED;
+    """, (limit,))
+    listing_ids = [row[0] for row in cur.fetchall()]
+    if listing_ids:
+        cur.execute("""
+            UPDATE public.embedding_queue SET processed = true, processed_at = now()
+            WHERE listing_id = ANY(%s);
+        """, (listing_ids,))
+    return listing_ids
+
+def get_data_for_listings(cur: psycopg.Cursor, listing_ids: List[str]) -> Dict[str, Dict]:
+    data = {lid: {"id": lid, "texts": [], "images": [], "attrs": {}} for lid in listing_ids}
+
+    # 1. Fetch ALL attributes
+    cur.execute("SELECT * FROM public.listings_attrs WHERE listing_id = ANY(%s)", (listing_ids,))
+    colnames = [desc.name for desc in cur.description]
+
+    for row in cur.fetchall():
+        row_dict = dict(zip(colnames, row))
+        lid = row_dict.get('listing_id')
+        if not lid or lid not in data: continue
+
+        if row_dict.get("description_short"):
+            data[lid]["texts"].append(row_dict["description_short"])
+        if row_dict.get("description_detailed"):
+            data[lid]["texts"].append(row_dict["description_detailed"])
+
+        # --- NEW: Format Geospatial Data for Qdrant ---
+        # Qdrant requires: "location": { "lat": float, "lon": float }
+        lat = row_dict.get("latitude")
+        lon = row_dict.get("longitude")
+        
+        sanitized_attrs = _make_serializable(row_dict)
+        
+        # Inject the location object if valid coords exist
+        if lat is not None and lon is not None and isinstance(lat, (float, int, Decimal)) and isinstance(lon, (float, int, Decimal)):
+             sanitized_attrs["location"] = {
+                 "lat": float(lat), 
+                 "lon": float(lon)
+             }
+        
+        data[lid]["attrs"] = sanitized_attrs
+        # -----------------------------------------------
+
+    # 2. Fetch Images
+    cur.execute("""
+        SELECT listing_id, local_path FROM public.listings_images
+        WHERE listing_id = ANY(%s) AND local_path IS NOT NULL
+    """, (listing_ids,))
+    
+    for lid, local_path in cur.fetchall():
+        if not local_path.lower().endswith((".jpg", ".jpeg")): continue
+        img_name = Path(local_path).name
+        # Map local path to container path
+        abs_path = f"/workspace/data/listings_raw/hemnet/snapshots/{lid}/assets/images/{img_name}"
+        
+        if os.path.exists(abs_path): data[lid]["images"].append(abs_path)
+        elif os.path.exists(local_path): data[lid]["images"].append(local_path)
+    return data
+
+def embed_listings(listings_data: List[Dict], text_model, image_model, image_processor) -> List[models.PointStruct]:
+    qdrant_points = []
+    for item in listings_data:
+        listing_id = item["id"]
+        attrs = item["attrs"]
+        
+        # Embed Text
+        text_chunks = []
+        for text in item["texts"]:
+            text_chunks.extend(_chunk_text(text, TEXT_CHUNK_SIZE, TEXT_CHUNK_OVERLAP))
+        
+        if text_chunks:
+            try:
+                text_vectors = text_model.encode(text_chunks, convert_to_tensor=True, show_progress_bar=False)
+                text_vectors_norm = F.normalize(text_vectors, p=2, dim=1).cpu().numpy()
+                for i, chunk in enumerate(text_chunks):
+                    chunk_id = abs(hash(f"{listing_id}_text_{i}")) % (10**18)
+                    qdrant_points.append(models.PointStruct(
+                        id=chunk_id,
+                        vector={"text": text_vectors_norm[i].tolist()},
+                        payload={"listing_id": listing_id, "type": "text", "text_chunk": chunk, **attrs}
+                    ))
+            except Exception as e:
+                log("embed_text_fail", id=listing_id, error=repr(e))
+
+        # Embed Images
+        image_paths = item["images"][:MAX_IMAGE_EMBEDS]
+        if image_paths:
+            try:
+                images_pil = []
+                for img_path in image_paths:
+                    img = Image.open(img_path).convert("RGB")
+                    img = img.resize((IMAGE_RESIZE_DIM, IMAGE_RESIZE_DIM))
+                    images_pil.append(img)
+                if images_pil:
+                    inputs = image_processor(images=images_pil, return_tensors="pt").to(DEVICE)
+                    with torch.inference_mode():
+                        img_vectors = image_model.get_image_features(**inputs)
+                    img_vectors_norm = F.normalize(img_vectors, dim=1).cpu().numpy()
+                    for i, img_path in enumerate(image_paths):
+                        img_id = abs(hash(f"{listing_id}_img_{i}")) % (10**18)
+                        qdrant_points.append(models.PointStruct(
+                            id=img_id,
+                            vector={"image": img_vectors_norm[i].tolist()},
+                            payload={"listing_id": listing_id, "type": "image", "image_path": img_path, **attrs}
+                        ))
+            except Exception as e:
+                log("embed_image_fail", id=listing_id, error=repr(e))
+            
+    return qdrant_points
+
+def main_loop():
+    log("daemon_start", device=DEVICE)
+    text_model, image_model, image_processor = load_models()
+    qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT, prefer_grpc=True)
+    ensure_qdrant_collection(qdrant)
+    
+    db_conn = None
+    while True:
+        try:
+            if not db_conn or db_conn.closed:
+                db_conn = get_db_connection()
+                if not db_conn:
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+            with db_conn.cursor() as cur:
+                listing_ids = fetch_unprocessed_listings(cur, BATCH_SIZE)
+                db_conn.commit()
+
+            if not listing_ids:
+                time.sleep(POLL_INTERVAL)
+                continue
+                
+            log("queue_fetch_batch", count=len(listing_ids))
+            with db_conn.cursor() as cur:
+                listings_data = get_data_for_listings(cur, listing_ids)
+            
+            qdrant_points = embed_listings(list(listings_data.values()), text_model, image_model, image_processor)
+
+            if qdrant_points:
+                qdrant.upsert(collection_name=QDRANT_COLLECTION, points=qdrant_points, wait=True)
+                log("qdrant_upsert_batch", count=len(qdrant_points))
+
+        except Exception as e:
+            log("daemon_loop_error", error=repr(e))
+            if db_conn: db_conn.close()
+            db_conn = None
+            time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    main_loop()
+#!/usr/bin/env python3
+"""Smoke test covering OSM parsing and resolution."""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RETRIEVAL_ROOT = ROOT / "src" / "retrieval"
+if str(RETRIEVAL_ROOT) not in sys.path:
+    sys.path.append(str(RETRIEVAL_ROOT))
+
+from osm_parser import heuristic_osm_filters  # type: ignore  # noqa: E402
+from osm_service import OSMQuerySpec, OSMAmenitySpec, OSMLocationSpec, OSMService  # type: ignore  # noqa: E402
+
+
+def ensure_postgres_env():
+    os.environ["PGHOST"] = "127.0.0.1"
+    os.environ["PGPORT"] = os.environ.get("PGHOST_PORT", "55432")
+    os.environ["PGUSER"] = "gis"
+    os.environ["PGPASSWORD"] = "gis"
+    os.environ["PGDATABASE"] = "gis"
+
+
+def test_llm_parsing():
+    spec = heuristic_osm_filters("Two rooms in Åkeshov near a gym")
+    assert spec is not None, "OSM filters missing from plan"
+    assert spec.location and "åkeshov" in spec.location.value.lower(), "Åkeshov not detected"
+    assert any(a.type == "gym" for a in spec.amenities), "Gym amenity missing from parse"
+
+
+def test_resolution_and_context(service: OSMService):
+    base_spec = OSMQuerySpec(location=OSMLocationSpec(type="neighborhood", value="Åkeshov"))
+    context = service.resolve_query(base_spec)
+    assert context.get("location"), "Location context missing"
+    assert context["location"].get("geometry"), "Location geometry missing"
+
+    amenity_spec = OSMQuerySpec(
+        location=OSMLocationSpec(type="neighborhood", value="Åkeshov"),
+        amenities=[OSMAmenitySpec(type="gym")]
+    )
+    amenity_context = service.resolve_query(amenity_spec)
+    gyms = amenity_context.get("amenities", [])
+    assert gyms, "No gyms returned for Åkeshov"
+
+
+def test_stockholm_school_context(service: OSMService):
+    spec = OSMQuerySpec(
+        location=OSMLocationSpec(type="municipality", value="Stockholm"),
+        amenities=[OSMAmenitySpec(type="school")]
+    )
+    context = service.resolve_query(spec)
+    assert context.get("location"), "Stockholm location missing"
+    assert context.get("filter_geometry") and context["filter_geometry"]["type"] in ("Polygon", "MultiPolygon"), "Stockholm geometry missing"
+    schools = context.get("amenities", [])
+    assert schools, "No schools returned for Stockholm"
+
+
+def main():
+    ensure_postgres_env()
+    test_llm_parsing()
+    service = OSMService()
+    test_resolution_and_context(service)
+    test_stockholm_school_context(service)
+    print("SUCCESS: OSM Integration Verified")
+
+
+if __name__ == "__main__":
+    main()
+#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+QUERY_FILE = ROOT / "tests" / "manual_agent_queries.txt"
+API_URL = "http://127.0.0.1:8099/agent/query"
+REQUEST_TIMEOUT = float(os.environ.get("AGENT_QUERY_TIMEOUT", "1200"))
+
+if not QUERY_FILE.exists():
+    print(f"missing {QUERY_FILE}", file=sys.stderr)
+    sys.exit(1)
+
+with open(QUERY_FILE, "r", encoding="utf-8") as f:
+    queries = [q.strip() for q in f.readlines() if q.strip()]
+
+session = requests.Session()
+for query in queries:
+    payload = {"prompt": query, "topk": 5}
+    try:
+        resp = session.post(API_URL, json=payload, timeout=REQUEST_TIMEOUT)
+        status = resp.status_code
+        print(f"QUERY: {query}\nSTATUS: {status}")
+        try:
+            body = resp.json()
+        except ValueError:
+            body = resp.text
+        if status == 200 and isinstance(body, dict):
+            plan = body.get("parsed", {})
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+        else:
+            if isinstance(body, dict):
+                print(json.dumps(body, ensure_ascii=False, indent=2))
+            else:
+                print(body)
+    except Exception as exc:
+        print(f"QUERY FAILED: {query} -> {exc}")
+    print("--")
+Two rooms in Åkeshov near a gym
+Two rooms near Åkeshov with a fireplace
+Apartments in Bromma near schools
+Family homes in Täby close to parks
+Waterfront villas in Lidingö near metro

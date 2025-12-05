@@ -23,8 +23,8 @@ services:
     gpus: all
     environment:
       SEARCH_GPU: ${SEARCH_GPU:-1}
-      CUDA_VISIBLE_DEVICES: ${SEARCH_GPU:-1}
-      NVIDIA_VISIBLE_DEVICES: ${SEARCH_GPU:-1}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-1}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-1}
       NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-all}
       HF_HOME: /workspace/models
       TRANSFORMERS_CACHE: /workspace/models
@@ -37,6 +37,13 @@ services:
       PGUSER: ${PGUSER:-gis}
       PGPASSWORD: ${PGPASSWORD:-gis}
       PGDATABASE: ${PGDATABASE:-gis}
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      LLM_GPU_IDS: ${LLM_GPU_IDS:-1}
+      LLM_GPU_MAX_MEM: ${LLM_GPU_MAX_MEM:-9GiB}
+      LLM_CPU_MAX_MEM: ${LLM_CPU_MAX_MEM:-48GiB}
+      LLM_PREFER_4BIT: ${LLM_PREFER_4BIT:-0}
+      EMBED_DEVICE: ${EMBED_DEVICE:-cuda}
+      RETRIEVAL_EMBED_DEVICE: ${RETRIEVAL_EMBED_DEVICE:-cuda}
       
     volumes:
       - ../../data:/workspace/data
@@ -50,4 +57,4 @@ services:
     # Modified command to run daemon in background (&) and API in foreground
     command: >
       bash -lc "python3 embed_daemon.py &
-                python3 -m uvicorn search_api:app --host 0.0.0.0 --port 8099"
+                python3 -m uvicorn search_api:app --host 0.0.0.0 --port 8099 --timeout-keep-alive 1200"

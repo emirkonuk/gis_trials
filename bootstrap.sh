@@ -8,16 +8,18 @@ GIS_BOOTSTRAP_FORCE_BUILD="${GIS_BOOTSTRAP_FORCE_BUILD:-0}"
 GIS_BOOTSTRAP_FORCE_RASTERS="${GIS_BOOTSTRAP_FORCE_RASTERS:-0}"
 GIS_BOOTSTRAP_FORCE_RETRIEVAL="${GIS_BOOTSTRAP_FORCE_RETRIEVAL:-0}"
 GIS_BOOTSTRAP_FORCE_VECTORS="${GIS_BOOTSTRAP_FORCE_VECTORS:-0}"
+GIS_BOOTSTRAP_FORCE_OSM="${GIS_BOOTSTRAP_FORCE_OSM:-0}"
 
 usage() {
   cat <<'USAGE'
-Usage: ./bootstrap.sh [--infer-gpu N] [--search-gpu M] [--force-build] [--force-rasters] [--force-retrieval] [--force-vectors]
+Usage: ./bootstrap.sh [--infer-gpu N] [--search-gpu M] [--force-build] [--force-rasters] [--force-retrieval] [--force-vectors] [--force-osm]
   --infer-gpu N      GPU index for the inference service (default 0)
   --search-gpu M     GPU index for the retrieval/search service (default 1)
   --force-build      Rebuild all images with --no-cache
   --force-rasters    Regenerate mosaics, overviews, and MBTiles even if they already exist
   --force-retrieval  Force legacy retrieval backfill (usually skipped in favor of daemon)
   --force-vectors    Reload vector layers into PostGIS even if a previous load exists
+  --force-osm        Re-run OSM ingestion even when the lock file is present
 USAGE
 }
 
@@ -37,6 +39,8 @@ while [[ $# -gt 0 ]]; do
       GIS_BOOTSTRAP_FORCE_RETRIEVAL=1; shift ;;
     --force-vectors)
       GIS_BOOTSTRAP_FORCE_VECTORS=1; shift ;;
+    --force-osm)
+      GIS_BOOTSTRAP_FORCE_OSM=1; shift ;;
     --help|-h)
       usage; exit 0 ;;
     *)
@@ -45,7 +49,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 export INFER_GPU SEARCH_GPU GIS_BOOTSTRAP_FORCE_BUILD GIS_BOOTSTRAP_FORCE_RASTERS
-export GIS_BOOTSTRAP_FORCE_RETRIEVAL GIS_BOOTSTRAP_FORCE_VECTORS
+export GIS_BOOTSTRAP_FORCE_RETRIEVAL GIS_BOOTSTRAP_FORCE_VECTORS GIS_BOOTSTRAP_FORCE_OSM
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="$ROOT/data"
@@ -210,6 +214,7 @@ build_images "$GIS_BOOTSTRAP_FORCE_BUILD"
 echo "--- Core Services ---"
 start_service CORE_COMPOSE db
 wait_for_pg || true
+"$ROOT/scripts/setup_osm.sh"
 start_service CORE_COMPOSE mbtileserver
 start_service CORE_COMPOSE web
 start_service CORE_COMPOSE pgtileserv

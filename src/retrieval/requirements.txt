@@ -20,3 +20,4 @@ psycopg[binary]
 sentence-transformers
 bitsandbytes
 protobuf
+jsonformer

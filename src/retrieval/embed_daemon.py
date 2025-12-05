@@ -40,7 +40,13 @@ QDRANT_HOST = os.environ.get("QDRANT_HOST", "qdrant")
 QDRANT_PORT = int(os.environ.get("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = "hemnet_listings_v1"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ENV_DEVICE = os.environ.get("EMBED_DEVICE")
+if ENV_DEVICE:
+    DEVICE = ENV_DEVICE.lower()
+else:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if DEVICE not in ("cuda", "cpu"):
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- Model Config ---
 TEXT_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'

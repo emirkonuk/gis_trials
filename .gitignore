@@ -12,3 +12,4 @@ __pycache__/
 *.tiff
 models/
 .bootstrap_built
+.venv/
